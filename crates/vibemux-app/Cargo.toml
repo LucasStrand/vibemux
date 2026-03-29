@@ -1,0 +1,24 @@
+[package]
+name = "vibemux-app"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "vibemux-app"
+path = "src/main.rs"
+
+[dependencies]
+vibemux-term = { workspace = true }
+vibemux-mux = { workspace = true }
+vibemux-ipc = { workspace = true }
+vibemux-config = { workspace = true }
+
+iced = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+git2 = { workspace = true }
