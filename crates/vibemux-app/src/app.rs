@@ -567,10 +567,10 @@ impl VibeMux {
         let keys =
             event::listen_with(|event, _status, _id| match event {
                 iced::Event::Keyboard(keyboard::Event::KeyPressed {
-                    key,
+                    modified_key,
                     modifiers,
                     ..
-                }) => Some(Message::KeyboardInput(key, modifiers)),
+                }) => Some(Message::KeyboardInput(modified_key, modifiers)),
                 _ => None,
             });
 
