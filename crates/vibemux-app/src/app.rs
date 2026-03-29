@@ -67,12 +67,9 @@ impl VibeMux {
                 git_info::detect_git_branch(&cwd_str);
         }
 
-        eprintln!("[init] spawning terminal...");
         let terminal =
             Terminal::spawn(30, 120, None).expect("Failed to spawn terminal");
-        eprintln!("[init] terminal spawned, starting PTY reader...");
         let pty_reader = PtyReader::spawn(terminal.pty.get_reader());
-        eprintln!("[init] PTY reader started");
 
         let mut terminals = HashMap::new();
         terminals.insert(pane_id, terminal);
@@ -432,13 +429,6 @@ impl VibeMux {
 
                     if let Some(data) = data {
                         self.bytes_received += data.len();
-                        eprintln!(
-                            "[tick] processing {} bytes for pane (total: {}), cursor at ({},{})",
-                            data.len(),
-                            self.bytes_received,
-                            self.terminals.get(&pane_id).map_or(0, |t| t.grid.cursor_row),
-                            self.terminals.get(&pane_id).map_or(0, |t| t.grid.cursor_col),
-                        );
                         if let Some(terminal) =
                             self.terminals.get_mut(&pane_id)
                         {

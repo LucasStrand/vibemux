@@ -28,11 +28,8 @@ impl PtyReader {
                 };
 
                 if n == 0 {
-                    eprintln!("[pty-reader] EOF from PTY");
                     break;
                 }
-
-                eprintln!("[pty-reader] read {} bytes from PTY", n);
                 {
                     let mut buf = buf_clone.lock().unwrap();
                     buf.push_back(read_buf[..n].to_vec());

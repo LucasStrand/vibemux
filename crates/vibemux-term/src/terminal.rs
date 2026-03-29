@@ -36,6 +36,11 @@ impl Terminal {
     pub fn process_output(&mut self, data: &[u8]) {
         let mut handler = VteHandler::new(&mut self.grid);
         self.parser.advance(&mut handler, data);
+
+        let responses = self.grid.drain_responses();
+        for response in responses {
+            let _ = self.pty.write_all(&response);
+        }
     }
 
     pub fn take_notification(&mut self) -> Option<Notification> {

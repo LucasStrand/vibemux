@@ -73,6 +73,8 @@ pub struct TerminalGrid {
     pub osc_cwd: Option<String>,
     /// Title set by OSC 0/2
     pub title: Option<String>,
+    /// Queued responses to send back to the PTY
+    pub response_queue: Vec<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
@@ -98,6 +100,7 @@ impl TerminalGrid {
             pending_notification: None,
             osc_cwd: None,
             title: None,
+            response_queue: Vec::new(),
         }
     }
 
@@ -291,6 +294,14 @@ impl TerminalGrid {
     pub fn scrollback_len(&self) -> usize {
         self.scrollback.len()
     }
+
+    pub fn drain_responses(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.response_queue)
+    }
+
+    fn queue_response(&mut self, data: Vec<u8>) {
+        self.response_queue.push(data);
+    }
 }
 
 fn ansi_color(idx: u16) -> Color {
@@ -425,15 +436,47 @@ impl vte::Perform for VteHandler<'_> {
     fn csi_dispatch(
         &mut self,
         params: &vte::Params,
-        _intermediates: &[u8],
+        intermediates: &[u8],
         _ignore: bool,
         action: char,
     ) {
         let params_vec: Vec<u16> = params.iter().flat_map(|p| p.iter().copied()).collect();
         let p0 = params_vec.first().copied().unwrap_or(0);
         let p1 = if params_vec.len() > 1 { params_vec[1] } else { 0 };
+        let is_private = intermediates.contains(&b'?');
+        let is_gt = intermediates.contains(&b'>');
 
         match action {
+            'c' if is_gt => {
+                // Secondary Device Attributes - respond as VT100
+                self.grid.queue_response(b"\x1b[>0;0;0c".to_vec());
+                return;
+            }
+            'c' => {
+                // Primary Device Attributes - respond as VT102
+                self.grid.queue_response(b"\x1b[?6c".to_vec());
+                return;
+            }
+            'n' => {
+                match p0 {
+                    5 => {
+                        // Device Status Report - respond OK
+                        self.grid.queue_response(b"\x1b[0n".to_vec());
+                        return;
+                    }
+                    6 => {
+                        // Cursor Position Report
+                        let response = format!(
+                            "\x1b[{};{}R",
+                            self.grid.cursor_row + 1,
+                            self.grid.cursor_col + 1
+                        );
+                        self.grid.queue_response(response.into_bytes());
+                        return;
+                    }
+                    _ => {}
+                }
+            }
             'A' => {
                 let n = p0.max(1) as usize;
                 self.grid.cursor_row = self.grid.cursor_row.saturating_sub(n);
@@ -468,13 +511,35 @@ impl vte::Perform for VteHandler<'_> {
                 }
             }
             'h' => {
-                if p0 == 25 {
-                    self.grid.cursor_visible = true;
+                if is_private {
+                    for &p in &params_vec {
+                        match p {
+                            1 => {} // Application Cursor Keys - accept silently
+                            7 => {} // Auto-wrap mode
+                            12 => {} // Cursor blink
+                            25 => self.grid.cursor_visible = true,
+                            1000 | 1002 | 1003 | 1006 => {} // Mouse tracking
+                            1049 => {} // Alternate screen buffer
+                            2004 => {} // Bracketed paste
+                            _ => {}
+                        }
+                    }
                 }
             }
             'l' => {
-                if p0 == 25 {
-                    self.grid.cursor_visible = false;
+                if is_private {
+                    for &p in &params_vec {
+                        match p {
+                            1 => {}
+                            7 => {}
+                            12 => {}
+                            25 => self.grid.cursor_visible = false,
+                            1000 | 1002 | 1003 | 1006 => {}
+                            1049 => {}
+                            2004 => {}
+                            _ => {}
+                        }
+                    }
                 }
             }
             'G' => {
