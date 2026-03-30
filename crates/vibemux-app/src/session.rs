@@ -11,9 +11,15 @@ pub struct SessionState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceState {
     pub name: String,
+    pub pinned: bool,
+    pub tabs: Vec<TabState>,
+    pub active_tab_index: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TabState {
     pub cwd: Option<String>,
     pub split_layout: SplitLayoutState,
-    pub pinned: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

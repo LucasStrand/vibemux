@@ -81,7 +81,10 @@ pub fn search_grid(
     let query_lower = query.to_lowercase();
     let mut matches = vec![];
 
-    for (row_idx, row) in grid.visible_cells().iter().enumerate() {
+    for row_idx in 0..grid.display_line_count() {
+        let Some(row) = grid.display_line_cells(row_idx) else {
+            continue;
+        };
         let line: String = row.iter().map(|c| c.c).collect();
         let line_lower = line.to_lowercase();
         let mut start = 0;

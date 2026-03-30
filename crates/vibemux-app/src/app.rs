@@ -3,13 +3,21 @@ use crate::find_bar::FindBar;
 use crate::git_info;
 use crate::notifications::NotificationManager;
 use crate::pty_stream::PtyReader;
-use crate::{sidebar, split_view, theme};
+use crate::term_selection::{
+    clamp_cell_for_input_line, clamp_selection_to_input, delete_selection_via_pty,
+    input_start_column, logical_line_end_col, move_cell as sel_move_cell, point_to_cell,
+    selection_text, TerminalSelection,
+};
+use crate::{sidebar, split_view, tab_bar, theme};
+use iced::clipboard;
 use iced::keyboard;
-use iced::widget::{container, row, text};
-use iced::{event, Element, Fill, Length, Subscription, Task, Theme};
+use iced::mouse;
+use iced::widget::operation;
+use iced::widget::{column, container, row, text};
+use iced::{event, Element, Fill, Length, Point, Subscription, Task, Theme};
 use std::collections::HashMap;
 use uuid::Uuid;
-use vibemux_mux::{Pane, PaneId, SplitDirection, SplitTree, WorkspaceManager};
+use vibemux_mux::{Pane, PaneId, SplitTree, WorkspaceManager, WorkspaceTab};
 use vibemux_term::Terminal;
 
 pub struct VibeMux {
@@ -24,6 +32,16 @@ pub struct VibeMux {
     show_notification_panel: bool,
     last_session_save: std::time::Instant,
     bytes_received: usize,
+    /// When true, new PTY output snaps the terminal scroll view to the bottom.
+    terminal_stick_to_bottom: HashMap<PaneId, bool>,
+    terminal_selection: HashMap<PaneId, Option<TerminalSelection>>,
+    /// Last pointer position inside each pane's terminal (local coords).
+    terminal_pointer_local: HashMap<PaneId, Point>,
+    /// Pane where the user pressed the mouse for drag-select (`None` after release).
+    selection_drag_pane: Option<PaneId>,
+    /// Anchor cell for an in-progress selection (shown only after pointer moves).
+    selection_pending_anchor: Option<(PaneId, (usize, usize))>,
+    selection_drag_moved: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -50,6 +68,30 @@ pub enum Message {
     FindBarInput(String),
     SaveSession,
     Tick,
+    NewTab,
+    CloseTab(Uuid),
+    CloseActiveTab,
+    SelectTab(Uuid),
+    NextTab,
+    PrevTab,
+    TerminalViewportChanged(PaneId, bool),
+    TerminalMouseMove(PaneId, Point),
+    TerminalMouseDown(PaneId),
+    /// Left button released anywhere (finish drag / click selection).
+    TerminalMouseUpAnywhere,
+    CopyTerminalSelection,
+    /// Read clipboard and paste into the focused PTY (command palette).
+    RequestClipboardPaste,
+    /// Select editable text on the current shell line (command palette).
+    SelectAllTerminalInput,
+    /// Cut non-collapsed terminal selection (command palette).
+    CutTerminalSelection,
+    /// Clipboard paste into the focused PTY (Ctrl+Shift+V / Shift+Insert).
+    TerminalPaste(Option<String>),
+    /// Shift+arrows / Shift+PgUp/PgDn: extend selection (`delta` in display cells).
+    TerminalExtendSelection { delta_row: i32, delta_col: i32 },
+    TerminalExtendSelectionLineStart,
+    TerminalExtendSelectionLineEnd,
 }
 
 impl VibeMux {
@@ -58,13 +100,14 @@ impl VibeMux {
 
         let pane = Pane::new();
         let pane_id = pane.id;
-        manager.active_mut().split_tree = SplitTree::with_pane(pane_id);
-
-        if let Ok(cwd) = std::env::current_dir() {
-            let cwd_str = cwd.to_string_lossy().to_string();
-            manager.active_mut().metadata.cwd = Some(cwd_str.clone());
-            manager.active_mut().metadata.git_branch =
-                git_info::detect_git_branch(&cwd_str);
+        {
+            let tab = manager.active_mut().active_tab_mut();
+            tab.split_tree = SplitTree::with_pane(pane_id);
+            if let Ok(cwd) = std::env::current_dir() {
+                let cwd_str = cwd.to_string_lossy().to_string();
+                tab.cwd = Some(cwd_str.clone());
+                tab.git_branch = git_info::detect_git_branch(&cwd_str);
+            }
         }
 
         let terminal =
@@ -124,6 +167,12 @@ impl VibeMux {
                 show_notification_panel: false,
                 last_session_save: std::time::Instant::now(),
                 bytes_received: 0,
+                terminal_stick_to_bottom: HashMap::from([(pane_id, true)]),
+                terminal_selection: HashMap::new(),
+                terminal_pointer_local: HashMap::new(),
+                selection_drag_pane: None,
+                selection_pending_anchor: None,
+                selection_drag_moved: false,
             },
             Task::none(),
         )
@@ -134,17 +183,32 @@ impl VibeMux {
             let reader = PtyReader::spawn(terminal.pty.get_reader());
             self.terminals.insert(pane_id, terminal);
             self.pty_readers.insert(pane_id, reader);
+            self.terminal_stick_to_bottom.insert(pane_id, true);
         }
     }
 
     fn remove_terminal(&mut self, pane_id: PaneId) {
         self.terminals.remove(&pane_id);
         self.pty_readers.remove(&pane_id);
+        self.terminal_stick_to_bottom.remove(&pane_id);
+        self.terminal_selection.remove(&pane_id);
+        self.terminal_pointer_local.remove(&pane_id);
+        if self.selection_drag_pane == Some(pane_id) {
+            self.selection_drag_pane = None;
+        }
+        if self
+            .selection_pending_anchor
+            .map(|(p, _)| p == pane_id)
+            .unwrap_or(false)
+        {
+            self.selection_pending_anchor = None;
+        }
     }
 
     pub fn title(&self) -> String {
         let ws = self.workspace_manager.active();
-        if let Some(ref title) = ws.metadata.title {
+        let tab = ws.active_tab();
+        if let Some(ref title) = tab.title {
             format!("VibeMux - {title}")
         } else {
             format!("VibeMux - {}", ws.name)
@@ -164,8 +228,10 @@ impl VibeMux {
 
                 let pane = Pane::new();
                 let pane_id = pane.id;
-                self.workspace_manager.active_mut().split_tree =
-                    SplitTree::with_pane(pane_id);
+                self.workspace_manager
+                    .active_mut()
+                    .active_tab_mut()
+                    .split_tree = SplitTree::with_pane(pane_id);
                 self.spawn_terminal(pane_id);
             }
             Message::CloseWorkspace(id) => {
@@ -174,7 +240,7 @@ impl VibeMux {
                     .workspaces()
                     .iter()
                     .find(|w| w.id == id)
-                    .map(|w| w.split_tree.pane_ids())
+                    .map(|w| w.all_pane_ids())
                     .unwrap_or_default();
 
                 for pid in pane_ids {
@@ -185,14 +251,6 @@ impl VibeMux {
             Message::SelectWorkspace(id) => {
                 self.workspace_manager.select_workspace(id);
                 self.notification_manager.mark_workspace_read(id);
-                if let Some(ws) = self
-                    .workspace_manager
-                    .workspaces()
-                    .iter()
-                    .find(|w| w.id == id)
-                {
-                    // has_unread is updated below in tick
-                }
             }
             Message::NextWorkspace => {
                 self.workspace_manager.next_workspace();
@@ -203,14 +261,14 @@ impl VibeMux {
             Message::SplitRight => {
                 let pane = Pane::new();
                 let pane_id = pane.id;
-                let tree = &mut self.workspace_manager.active_mut().split_tree;
+                let tree = self.workspace_manager.active_mut().split_tree_mut();
                 tree.split(pane_id, vibemux_mux::SplitDirection::Vertical);
                 self.spawn_terminal(pane_id);
             }
             Message::SplitDown => {
                 let pane = Pane::new();
                 let pane_id = pane.id;
-                let tree = &mut self.workspace_manager.active_mut().split_tree;
+                let tree = self.workspace_manager.active_mut().split_tree_mut();
                 tree.split(pane_id, vibemux_mux::SplitDirection::Horizontal);
                 self.spawn_terminal(pane_id);
             }
@@ -218,23 +276,30 @@ impl VibeMux {
                 if let Some(terminal) = self.terminals.get_mut(&pane_id) {
                     terminal.process_output(&data);
 
-                    if let Some(cwd) = terminal.grid.osc_cwd.clone() {
-                        self.workspace_manager.active_mut().metadata.cwd =
-                            Some(cwd);
-                    }
-                    if let Some(title) = terminal.grid.title.clone() {
-                        self.workspace_manager.active_mut().metadata.title =
-                            Some(title);
+                    if let Some((wi, ti)) =
+                        self.workspace_manager.locate_pane(pane_id)
+                    {
+                        let ws = &mut self.workspace_manager.workspaces_mut()[wi];
+                        let tab = &mut ws.tabs[ti];
+                        if let Some(cwd) = terminal.grid.osc_cwd.clone() {
+                            let old = tab.cwd.clone();
+                            tab.cwd = Some(cwd.clone());
+                            if old.as_deref() != Some(&cwd) {
+                                tab.git_branch = git_info::detect_git_branch(&cwd);
+                            }
+                        }
+                        if let Some(title) = terminal.grid.title.clone() {
+                            tab.title = Some(title);
+                        }
                     }
                 }
             }
             Message::FocusPane(pane_id) => {
-                self.workspace_manager.active_mut().split_tree.focused_pane =
+                self.workspace_manager.active_mut().split_tree_mut().focused_pane =
                     Some(pane_id);
             }
             Message::FocusNextPane => {
-                let tree =
-                    &mut self.workspace_manager.active_mut().split_tree;
+                let tree = self.workspace_manager.active_mut().split_tree_mut();
                 let panes = tree.pane_ids();
                 if let Some(focused) = tree.focused_pane {
                     if let Some(idx) =
@@ -247,13 +312,192 @@ impl VibeMux {
             }
             Message::CloseFocusedPane => {
                 if let Some(focused) = self.focused_pane_id() {
-                    let tree =
-                        &mut self.workspace_manager.active_mut().split_tree;
+                    let tree = self.workspace_manager.active_mut().split_tree_mut();
                     if tree.pane_ids().len() > 1 {
                         tree.remove_pane(focused);
                         self.remove_terminal(focused);
                     }
                 }
+            }
+            Message::NewTab => {
+                let pane = Pane::new();
+                let pane_id = pane.id;
+                let mut tab = WorkspaceTab::new();
+                tab.split_tree = SplitTree::with_pane(pane_id);
+                let ws = self.workspace_manager.active_mut();
+                ws.tabs.push(tab);
+                ws.active_tab_index = ws.tabs.len() - 1;
+                self.spawn_terminal(pane_id);
+            }
+            Message::CloseTab(tab_id) => {
+                let pane_ids = {
+                    let ws = self.workspace_manager.active_mut();
+                    if ws.tabs.len() <= 1 {
+                        return Task::none();
+                    }
+                    let Some(ti) = ws.tabs.iter().position(|t| t.id == tab_id) else {
+                        return Task::none();
+                    };
+                    let pane_ids = ws.tabs[ti].split_tree.pane_ids();
+                    let old_active = ws.active_tab_index;
+                    ws.tabs.remove(ti);
+                    let new_len = ws.tabs.len();
+                    if old_active > ti {
+                        ws.active_tab_index = old_active - 1;
+                    } else if old_active == ti {
+                        ws.active_tab_index =
+                            old_active.min(new_len.saturating_sub(1));
+                    }
+                    pane_ids
+                };
+                for pid in pane_ids {
+                    self.remove_terminal(pid);
+                }
+            }
+            Message::CloseActiveTab => {
+                let tid = self.workspace_manager.active().active_tab().id;
+                return self.update(Message::CloseTab(tid));
+            }
+            Message::SelectTab(tab_id) => {
+                let ws = self.workspace_manager.active_mut();
+                if let Some(ti) = ws.tabs.iter().position(|t| t.id == tab_id) {
+                    ws.active_tab_index = ti;
+                }
+            }
+            Message::NextTab => {
+                let ws = self.workspace_manager.active_mut();
+                if !ws.tabs.is_empty() {
+                    ws.active_tab_index = (ws.active_tab_index + 1) % ws.tabs.len();
+                }
+            }
+            Message::PrevTab => {
+                let ws = self.workspace_manager.active_mut();
+                if !ws.tabs.is_empty() {
+                    ws.active_tab_index = if ws.active_tab_index == 0 {
+                        ws.tabs.len() - 1
+                    } else {
+                        ws.active_tab_index - 1
+                    };
+                }
+            }
+            Message::TerminalViewportChanged(pane_id, stick_to_bottom) => {
+                self.terminal_stick_to_bottom
+                    .insert(pane_id, stick_to_bottom);
+            }
+            Message::TerminalMouseMove(pane_id, pt) => {
+                self.terminal_pointer_local.insert(pane_id, pt);
+                if self.selection_drag_pane == Some(pane_id) {
+                    if let Some(terminal) = self.terminals.get(&pane_id) {
+                        let grid = &terminal.grid;
+                        let n = grid.display_line_count();
+                        let cols = grid.cols;
+                        let (r, c) = point_to_cell(pt.x, pt.y, cols, n);
+                        let cell = clamp_cell_for_input_line(grid, r, c);
+                        if let Some((p, anchor)) = self.selection_pending_anchor {
+                            if p == pane_id {
+                                if cell != anchor {
+                                    self.selection_drag_moved = true;
+                                }
+                                let mut sel = TerminalSelection {
+                                    anchor,
+                                    head: cell,
+                                };
+                                clamp_selection_to_input(grid, &mut sel);
+                                self.terminal_selection.insert(pane_id, Some(sel));
+                            }
+                        }
+                    }
+                }
+            }
+            Message::TerminalMouseDown(pane_id) => {
+                self.workspace_manager
+                    .active_mut()
+                    .split_tree_mut()
+                    .focused_pane = Some(pane_id);
+                self.selection_drag_pane = Some(pane_id);
+                self.selection_drag_moved = false;
+                for pid in self.terminal_selection.keys().copied().collect::<Vec<_>>() {
+                    if pid != pane_id {
+                        self.terminal_selection.insert(pid, None);
+                    }
+                }
+                let Some(terminal) = self.terminals.get(&pane_id) else {
+                    return Task::none();
+                };
+                let grid = &terminal.grid;
+                let n = grid.display_line_count();
+                let cols = grid.cols;
+                let p = self
+                    .terminal_pointer_local
+                    .get(&pane_id)
+                    .copied()
+                    .unwrap_or_else(|| Point::new(5.0, 5.0));
+                let (r, c) = point_to_cell(p.x, p.y, cols, n);
+                let cell = clamp_cell_for_input_line(grid, r, c);
+                self.selection_pending_anchor = Some((pane_id, cell));
+                self.terminal_selection.insert(pane_id, None);
+            }
+            Message::TerminalMouseUpAnywhere => {
+                let pane_opt = self.selection_drag_pane.take();
+                self.selection_pending_anchor = None;
+                if !self.selection_drag_moved {
+                    if let Some(pid) = pane_opt {
+                        self.terminal_selection.insert(pid, None);
+                    }
+                }
+            }
+            Message::RequestClipboardPaste => {
+                return clipboard::read().map(Message::TerminalPaste);
+            }
+            Message::SelectAllTerminalInput => {
+                self.select_all_terminal_input();
+            }
+            Message::CutTerminalSelection => {
+                return self.terminal_apply_selection_delete(true);
+            }
+            Message::TerminalPaste(text_opt) => {
+                let Some(raw) = text_opt else {
+                    return Task::none();
+                };
+                let text = sanitize_clipboard_for_shell(&raw);
+                if !text.is_empty() {
+                    if let Some(focused) = self.focused_pane_id() {
+                        if let Some(terminal) = self.terminals.get_mut(&focused) {
+                            self.terminal_selection.insert(focused, None);
+                            let _ = terminal.write(text.as_bytes());
+                        }
+                    }
+                }
+            }
+            Message::CopyTerminalSelection => {
+                let Some(focused) = self.focused_pane_id() else {
+                    return Task::none();
+                };
+                let Some(term) = self.terminals.get(&focused) else {
+                    return Task::none();
+                };
+                let Some(sel) =
+                    self.terminal_selection.get(&focused).and_then(|s| s.as_ref())
+                else {
+                    return Task::none();
+                };
+                if sel.collapsed() {
+                    return Task::none();
+                }
+                let s = selection_text(&term.grid, sel);
+                return clipboard::write::<Message>(s);
+            }
+            Message::TerminalExtendSelection {
+                delta_row,
+                delta_col,
+            } => {
+                self.extend_terminal_selection_keyboard(delta_row, delta_col);
+            }
+            Message::TerminalExtendSelectionLineStart => {
+                self.extend_terminal_selection_line_start();
+            }
+            Message::TerminalExtendSelectionLineEnd => {
+                self.extend_terminal_selection_line_end();
             }
             Message::KeyboardInput(key, modifiers) => {
                 if self.command_palette.visible {
@@ -283,6 +527,95 @@ impl VibeMux {
                             return Task::none();
                         }
                         _ => return Task::none(),
+                    }
+                }
+
+                if !self.command_palette.visible && !self.find_bar.visible {
+                    if let keyboard::Key::Named(keyboard::key::Named::Escape) =
+                        &key
+                    {
+                        if !modifiers.control() && !modifiers.alt() {
+                            if let Some(f) = self.focused_pane_id() {
+                                let had_range = self
+                                    .terminal_selection
+                                    .get(&f)
+                                    .and_then(|o| o.as_ref())
+                                    .is_some_and(|s| !s.collapsed());
+                                self.terminal_selection.insert(f, None);
+                                if had_range {
+                                    return Task::none();
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !self.command_palette.visible
+                    && !self.find_bar.visible
+                    && modifiers.shift()
+                    && !modifiers.control()
+                    && !modifiers.alt()
+                {
+                    use keyboard::key::Named;
+                    match &key {
+                        keyboard::Key::Named(Named::ArrowLeft) => {
+                            return self.update(Message::TerminalExtendSelection {
+                                delta_row: 0,
+                                delta_col: -1,
+                            });
+                        }
+                        keyboard::Key::Named(Named::ArrowRight) => {
+                            return self.update(Message::TerminalExtendSelection {
+                                delta_row: 0,
+                                delta_col: 1,
+                            });
+                        }
+                        keyboard::Key::Named(Named::ArrowUp) => {
+                            return self.update(Message::TerminalExtendSelection {
+                                delta_row: -1,
+                                delta_col: 0,
+                            });
+                        }
+                        keyboard::Key::Named(Named::ArrowDown) => {
+                            return self.update(Message::TerminalExtendSelection {
+                                delta_row: 1,
+                                delta_col: 0,
+                            });
+                        }
+                        keyboard::Key::Named(Named::Home) => {
+                            return self
+                                .update(Message::TerminalExtendSelectionLineStart);
+                        }
+                        keyboard::Key::Named(Named::End) => {
+                            return self
+                                .update(Message::TerminalExtendSelectionLineEnd);
+                        }
+                        keyboard::Key::Named(Named::PageUp) => {
+                            let rows = self
+                                .focused_pane_id()
+                                .and_then(|p| self.terminals.get(&p))
+                                .map(|t| t.grid.rows as i32)
+                                .unwrap_or(1);
+                            return self.update(Message::TerminalExtendSelection {
+                                delta_row: -rows.max(1),
+                                delta_col: 0,
+                            });
+                        }
+                        keyboard::Key::Named(Named::PageDown) => {
+                            let rows = self
+                                .focused_pane_id()
+                                .and_then(|p| self.terminals.get(&p))
+                                .map(|t| t.grid.rows as i32)
+                                .unwrap_or(1);
+                            return self.update(Message::TerminalExtendSelection {
+                                delta_row: rows.max(1),
+                                delta_col: 0,
+                            });
+                        }
+                        keyboard::Key::Named(Named::Insert) => {
+                            return clipboard::read().map(Message::TerminalPaste);
+                        }
+                        _ => {}
                     }
                 }
 
@@ -327,6 +660,36 @@ impl VibeMux {
                             return self
                                 .update(Message::ToggleCommandPalette);
                         }
+                        keyboard::Key::Character(c)
+                            if c.as_str() == "t" || c.as_str() == "T" =>
+                        {
+                            return self.update(Message::NewTab);
+                        }
+                        keyboard::Key::Character(c)
+                            if c.as_str() == "c" || c.as_str() == "C" =>
+                        {
+                            return self.update(Message::CopyTerminalSelection);
+                        }
+                        keyboard::Key::Character(c)
+                            if c.as_str().eq_ignore_ascii_case("v")
+                                && !self.command_palette.visible
+                                && !self.find_bar.visible =>
+                        {
+                            return clipboard::read().map(Message::TerminalPaste);
+                        }
+                        keyboard::Key::Character(c)
+                            if c.as_str().eq_ignore_ascii_case("a")
+                                && !self.command_palette.visible
+                                && !self.find_bar.visible =>
+                        {
+                            self.select_all_terminal_input();
+                            return Task::none();
+                        }
+                        keyboard::Key::Character(c)
+                            if c.as_str() == "f" || c.as_str() == "F" =>
+                        {
+                            return self.update(Message::ToggleFindBar);
+                        }
                         _ => {}
                     }
                 }
@@ -339,11 +702,20 @@ impl VibeMux {
                             return self
                                 .update(Message::NextWorkspace);
                         }
-                        keyboard::Key::Character(c)
-                            if c.as_str() == "f" =>
-                        {
-                            return self
-                                .update(Message::ToggleFindBar);
+                        keyboard::Key::Named(
+                            keyboard::key::Named::F4,
+                        ) => {
+                            return self.update(Message::CloseActiveTab);
+                        }
+                        keyboard::Key::Named(
+                            keyboard::key::Named::PageDown,
+                        ) => {
+                            return self.update(Message::NextTab);
+                        }
+                        keyboard::Key::Named(
+                            keyboard::key::Named::PageUp,
+                        ) => {
+                            return self.update(Message::PrevTab);
                         }
                         _ => {}
                     }
@@ -361,12 +733,42 @@ impl VibeMux {
                     }
                 }
 
+                // Backspace / Ctrl+Shift+X: delete or cut the in-app selection. The PTY
+                // cursor does not move with Shift+arrows, so a plain backspace would edit
+                // the wrong position unless we emit arrow + Delete sequences first.
+                if !self.command_palette.visible && !self.find_bar.visible {
+                    use keyboard::key::Named;
+                    if let Some(focused) = self.focused_pane_id() {
+                        let do_cut = modifiers.control()
+                            && modifiers.shift()
+                            && !modifiers.alt()
+                            && matches!(
+                                &key,
+                                keyboard::Key::Character(c)
+                                    if c.as_str().eq_ignore_ascii_case("x")
+                            );
+                        let do_bs = !modifiers.control()
+                            && !modifiers.alt()
+                            && matches!(&key, keyboard::Key::Named(Named::Backspace));
+                        if (do_cut || do_bs)
+                            && self
+                                .terminal_selection
+                                .get(&focused)
+                                .and_then(|o| o.as_ref())
+                                .is_some_and(|s| !s.collapsed())
+                        {
+                            return self.terminal_apply_selection_delete(do_cut);
+                        }
+                    }
+                }
+
                 let bytes = key_to_bytes(&key, &modifiers);
                 if let Some(bytes) = bytes {
                     if let Some(focused) = self.focused_pane_id() {
                         if let Some(terminal) =
                             self.terminals.get_mut(&focused)
                         {
+                            self.terminal_selection.insert(focused, None);
                             let _ = terminal.write(&bytes);
                         }
                     }
@@ -414,6 +816,8 @@ impl VibeMux {
             Message::Tick => {
                 let pane_ids: Vec<PaneId> =
                     self.pty_readers.keys().copied().collect();
+                let mut snap_tasks: Vec<Task<Message>> = Vec::new();
+
                 for pane_id in pane_ids {
                     let data =
                         if let Some(reader) = self.pty_readers.get(&pane_id) {
@@ -434,26 +838,29 @@ impl VibeMux {
                         {
                             terminal.process_output(&data);
 
-                            if let Some(cwd) =
-                                terminal.grid.osc_cwd.clone()
+                            if let Some((wi, ti)) =
+                                self.workspace_manager.locate_pane(pane_id)
                             {
                                 let ws =
-                                    self.workspace_manager.active_mut();
-                                let old_cwd = ws.metadata.cwd.clone();
-                                ws.metadata.cwd = Some(cwd.clone());
+                                    &mut self.workspace_manager.workspaces_mut()
+                                        [wi];
+                                let tab = &mut ws.tabs[ti];
+                                if let Some(cwd) =
+                                    terminal.grid.osc_cwd.clone()
+                                {
+                                    let old_cwd = tab.cwd.clone();
+                                    tab.cwd = Some(cwd.clone());
 
-                                if old_cwd.as_deref() != Some(&cwd) {
-                                    ws.metadata.git_branch =
-                                        git_info::detect_git_branch(&cwd);
+                                    if old_cwd.as_deref() != Some(&cwd) {
+                                        tab.git_branch =
+                                            git_info::detect_git_branch(&cwd);
+                                    }
                                 }
-                            }
-                            if let Some(title) =
-                                terminal.grid.title.clone()
-                            {
-                                self.workspace_manager
-                                    .active_mut()
-                                    .metadata
-                                    .title = Some(title);
+                                if let Some(title) =
+                                    terminal.grid.title.clone()
+                                {
+                                    tab.title = Some(title);
+                                }
                             }
 
                             if let Some(notif) =
@@ -467,6 +874,19 @@ impl VibeMux {
                                     notif.body,
                                     notif.subtitle,
                                 );
+                            }
+
+                            if self
+                                .terminal_stick_to_bottom
+                                .get(&pane_id)
+                                .copied()
+                                .unwrap_or(true)
+                            {
+                                snap_tasks.push(operation::snap_to_end(
+                                    iced::widget::Id::from(format!(
+                                        "term-scroll-{pane_id}"
+                                    )),
+                                ));
                             }
                         }
                     }
@@ -501,6 +921,10 @@ impl VibeMux {
                     self.save_session();
                     self.last_session_save = std::time::Instant::now();
                 }
+
+                if !snap_tasks.is_empty() {
+                    return Task::batch(snap_tasks);
+                }
             }
         }
 
@@ -511,18 +935,27 @@ impl VibeMux {
         let sidebar = sidebar::view(&self.workspace_manager);
 
         let active_ws = self.workspace_manager.active();
-        let focused = active_ws.split_tree.focused_pane;
+        let focused = active_ws.split_tree().focused_pane;
 
-        let content = if let Some(ref root) = active_ws.split_tree.root {
+        let term_area = if let Some(ref root) = active_ws.split_tree().root {
             split_view::render_split_tree(
                 root,
                 &self.terminals,
                 focused,
                 self.bytes_received,
+                &self.terminal_selection,
             )
         } else {
             empty_pane()
         };
+
+        let content = column![
+            tab_bar::view(active_ws),
+            container(term_area).width(Fill).height(Fill),
+        ]
+        .width(Fill)
+        .height(Fill)
+        .into();
 
         let divider = container(text(""))
             .width(Length::Fixed(1.0))
@@ -566,6 +999,9 @@ impl VibeMux {
 
         let keys =
             event::listen_with(|event, _status, _id| match event {
+                iced::Event::Mouse(mouse::Event::ButtonReleased(
+                    mouse::Button::Left,
+                )) => Some(Message::TerminalMouseUpAnywhere),
                 iced::Event::Keyboard(keyboard::Event::KeyPressed {
                     modified_key,
                     modifiers,
@@ -577,13 +1013,180 @@ impl VibeMux {
         Subscription::batch([tick, keys])
     }
 
+    /// Delete the non-collapsed terminal selection; optionally copy to clipboard (cut).
+    fn terminal_apply_selection_delete(&mut self, copy_to_clipboard: bool) -> Task<Message> {
+        let Some(focused) = self.focused_pane_id() else {
+            return Task::none();
+        };
+        let Some(sel) = self
+            .terminal_selection
+            .get(&focused)
+            .and_then(|o| o.as_ref())
+            .filter(|s| !s.collapsed())
+        else {
+            return Task::none();
+        };
+        let Some(term) = self.terminals.get(&focused) else {
+            return Task::none();
+        };
+        if let Some(bytes) = delete_selection_via_pty(&term.grid, sel) {
+            let cut_text = if copy_to_clipboard {
+                Some(selection_text(&term.grid, sel))
+            } else {
+                None
+            };
+            self.terminal_selection.insert(focused, None);
+            if let Some(terminal) = self.terminals.get_mut(&focused) {
+                let _ = terminal.write(&bytes);
+            }
+            if let Some(t) = cut_text {
+                return clipboard::write::<Message>(t);
+            }
+            return Task::none();
+        }
+        self.terminal_selection.insert(focused, None);
+        Task::none()
+    }
+
+    /// Select editable text on the current shell line (after the prompt through logical EOL).
+    fn select_all_terminal_input(&mut self) {
+        let Some(focused) = self.focused_pane_id() else {
+            return;
+        };
+        let Some(term) = self.terminals.get(&focused) else {
+            return;
+        };
+        let grid = &term.grid;
+        if grid.display_line_count() == 0 || grid.cols == 0 {
+            return;
+        }
+        let dr = grid.display_cursor_row();
+        let sc = input_start_column(grid, dr);
+        let ec = logical_line_end_col(grid, dr);
+        let mut sel = TerminalSelection {
+            anchor: (dr, sc),
+            head: (dr, ec),
+        };
+        clamp_selection_to_input(grid, &mut sel);
+        self.terminal_selection.insert(focused, Some(sel));
+    }
+
+    fn extend_terminal_selection_keyboard(&mut self, delta_row: i32, delta_col: i32) {
+        let Some(focused) = self.focused_pane_id() else {
+            return;
+        };
+        let Some(term) = self.terminals.get(&focused) else {
+            return;
+        };
+        let grid = &term.grid;
+        let n = grid.display_line_count();
+        let cols = grid.cols;
+        if n == 0 || cols == 0 {
+            return;
+        }
+        let cur = (grid.display_cursor_row(), grid.cursor_col);
+        match self.terminal_selection.get_mut(&focused) {
+            Some(Some(s)) => {
+                if s.collapsed() && s.head != cur {
+                    s.anchor = cur;
+                    s.head = cur;
+                }
+                s.head = sel_move_cell(s.head, delta_row, delta_col, n, cols);
+                clamp_selection_to_input(grid, s);
+            }
+            _ => {
+                let mut sel = TerminalSelection {
+                    anchor: cur,
+                    head: sel_move_cell(cur, delta_row, delta_col, n, cols),
+                };
+                clamp_selection_to_input(grid, &mut sel);
+                self.terminal_selection.insert(focused, Some(sel));
+            }
+        }
+    }
+
+    fn extend_terminal_selection_line_start(&mut self) {
+        let Some(focused) = self.focused_pane_id() else {
+            return;
+        };
+        let Some(term) = self.terminals.get(&focused) else {
+            return;
+        };
+        let grid = &term.grid;
+        let n = grid.display_line_count();
+        let cols = grid.cols;
+        if n == 0 || cols == 0 {
+            return;
+        }
+        let cur = (grid.display_cursor_row(), grid.cursor_col);
+        let start_c = input_start_column(grid, cur.0);
+        match self.terminal_selection.get_mut(&focused) {
+            Some(Some(s)) => {
+                if s.collapsed() && s.head != cur {
+                    s.anchor = cur;
+                    s.head = cur;
+                }
+                let start_c = input_start_column(grid, s.head.0);
+                let c = if s.head.0 == grid.display_cursor_row() {
+                    start_c
+                } else {
+                    0
+                };
+                s.head = (s.head.0, c);
+                clamp_selection_to_input(grid, s);
+            }
+            _ => {
+                let mut sel = TerminalSelection {
+                    anchor: cur,
+                    head: (cur.0, start_c),
+                };
+                clamp_selection_to_input(grid, &mut sel);
+                self.terminal_selection.insert(focused, Some(sel));
+            }
+        }
+    }
+
+    fn extend_terminal_selection_line_end(&mut self) {
+        let Some(focused) = self.focused_pane_id() else {
+            return;
+        };
+        let Some(term) = self.terminals.get(&focused) else {
+            return;
+        };
+        let grid = &term.grid;
+        if grid.display_line_count() == 0 || grid.cols == 0 {
+            return;
+        }
+        let cur = (grid.display_cursor_row(), grid.cursor_col);
+        match self.terminal_selection.get_mut(&focused) {
+            Some(Some(s)) => {
+                if s.collapsed() && s.head != cur {
+                    s.anchor = cur;
+                    s.head = cur;
+                }
+                let end_col = logical_line_end_col(grid, s.head.0);
+                s.head = (s.head.0, end_col);
+                clamp_selection_to_input(grid, s);
+            }
+            _ => {
+                let end_col = logical_line_end_col(grid, cur.0);
+                let mut sel = TerminalSelection {
+                    anchor: cur,
+                    head: (cur.0, end_col),
+                };
+                clamp_selection_to_input(grid, &mut sel);
+                self.terminal_selection.insert(focused, Some(sel));
+            }
+        }
+    }
+
     fn focused_pane_id(&self) -> Option<PaneId> {
-        self.workspace_manager.active().split_tree.focused_pane
+        self.workspace_manager.active().split_tree().focused_pane
     }
 
     fn save_session(&self) {
         use crate::session::{
-            capture_split_layout, SessionState, WorkspaceState,
+            capture_split_layout, SessionState, TabState, WorkspaceState,
         };
 
         let workspaces: Vec<WorkspaceState> = self
@@ -591,20 +1194,31 @@ impl VibeMux {
             .workspaces()
             .iter()
             .map(|ws| {
-                let layout = if let Some(ref root) = ws.split_tree.root {
-                    capture_split_layout(root, &|_pane_id| {
-                        ws.metadata.cwd.clone()
+                let tabs: Vec<TabState> = ws
+                    .tabs
+                    .iter()
+                    .map(|tab| {
+                        let split_layout =
+                            if let Some(ref root) = tab.split_tree.root {
+                                capture_split_layout(root, &|_| {
+                                    tab.cwd.clone()
+                                })
+                            } else {
+                                crate::session::SplitLayoutState::Single {
+                                    cwd: tab.cwd.clone(),
+                                }
+                            };
+                        TabState {
+                            cwd: tab.cwd.clone(),
+                            split_layout,
+                        }
                     })
-                } else {
-                    crate::session::SplitLayoutState::Single {
-                        cwd: ws.metadata.cwd.clone(),
-                    }
-                };
+                    .collect();
                 WorkspaceState {
                     name: ws.name.clone(),
-                    cwd: ws.metadata.cwd.clone(),
-                    split_layout: layout,
                     pinned: ws.pinned,
+                    tabs,
+                    active_tab_index: ws.active_tab_index,
                 }
             })
             .collect();
@@ -653,11 +1267,15 @@ impl VibeMux {
                     .workspaces()
                     .iter()
                     .map(|ws| {
+                        let t = ws
+                            .tabs
+                            .get(ws.active_tab_index)
+                            .or_else(|| ws.tabs.first());
                         json!({
                             "id": ws.id.to_string(),
                             "name": ws.name,
-                            "cwd": ws.metadata.cwd,
-                            "git_branch": ws.metadata.git_branch,
+                            "cwd": t.and_then(|x| x.cwd.clone()),
+                            "git_branch": t.and_then(|x| x.git_branch.clone()),
                         })
                     })
                     .collect();
@@ -685,8 +1303,10 @@ impl VibeMux {
 
                 let pane = Pane::new();
                 let pane_id = pane.id;
-                self.workspace_manager.active_mut().split_tree =
-                    SplitTree::with_pane(pane_id);
+                self.workspace_manager
+                    .active_mut()
+                    .active_tab_mut()
+                    .split_tree = SplitTree::with_pane(pane_id);
                 self.spawn_terminal(pane_id);
 
                 let _ = reply.send(Response::success(
@@ -705,7 +1325,7 @@ impl VibeMux {
                         .workspaces()
                         .iter()
                         .find(|w| w.id == id)
-                        .map(|w| w.split_tree.pane_ids())
+                        .map(|w| w.all_pane_ids())
                         .unwrap_or_default();
                     for pid in pane_ids {
                         self.remove_terminal(pid);
@@ -744,13 +1364,14 @@ impl VibeMux {
             }
             AppCommand::CurrentWorkspace { reply, req_id } => {
                 let ws = self.workspace_manager.active();
+                let tab = ws.active_tab();
                 let _ = reply.send(Response::success(
                     req_id,
                     json!({
                         "id": ws.id.to_string(),
                         "name": ws.name,
-                        "cwd": ws.metadata.cwd,
-                        "git_branch": ws.metadata.git_branch,
+                        "cwd": tab.cwd,
+                        "git_branch": tab.git_branch,
                     }),
                 ));
             }
@@ -925,14 +1546,15 @@ impl VibeMux {
             }
             AppCommand::ListSurfaces { reply, req_id } => {
                 let ws = self.workspace_manager.active();
+                let focused_tree = ws.split_tree();
                 let surfaces: Vec<serde_json::Value> = ws
-                    .split_tree
-                    .pane_ids()
+                    .tabs
                     .iter()
+                    .flat_map(|tab| tab.split_tree.pane_ids())
                     .map(|pid| {
                         json!({
                             "id": pid.to_string(),
-                            "focused": ws.split_tree.focused_pane == Some(*pid),
+                            "focused": focused_tree.focused_pane == Some(pid),
                         })
                     })
                     .collect();
@@ -955,6 +1577,21 @@ fn empty_pane<'a>() -> Element<'a, Message> {
             ..Default::default()
         })
         .into()
+}
+
+/// Normalize OS clipboard text before injecting into the shell.
+fn sanitize_clipboard_for_shell(raw: &str) -> String {
+    let s = raw.strip_prefix('\u{FEFF}').unwrap_or(raw);
+    let s = s.replace("\r\n", "\n").replace('\r', "\n");
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\t' | '\n' => out.push(ch),
+            c if !c.is_control() => out.push(c),
+            _ => {}
+        }
+    }
+    out
 }
 
 fn key_to_bytes(

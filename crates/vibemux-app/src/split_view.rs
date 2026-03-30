@@ -1,4 +1,5 @@
 use crate::app::Message;
+use crate::term_selection::TerminalSelection;
 use crate::theme;
 use crate::term_view;
 use iced::widget::{container, text, Column, Row};
@@ -12,6 +13,7 @@ pub fn render_split_tree<'a>(
     terminals: &'a HashMap<PaneId, Terminal>,
     focused_pane: Option<PaneId>,
     bytes_received: usize,
+    selections: &'a HashMap<PaneId, Option<TerminalSelection>>,
 ) -> Element<'a, Message> {
     match node {
         SplitNode::Leaf { pane_id } => {
@@ -19,7 +21,10 @@ pub fn render_split_tree<'a>(
             let pane_id = *pane_id;
 
             let content = if let Some(terminal) = terminals.get(&pane_id) {
-                term_view::view(&terminal.grid, bytes_received)
+                let sel = selections
+                    .get(&pane_id)
+                    .and_then(|s| s.as_ref());
+                term_view::view(&terminal.grid, bytes_received, pane_id, sel)
             } else {
                 container(text("No terminal").size(14).color(theme::FG_DIM))
                     .width(Fill)
@@ -59,10 +64,20 @@ pub fn render_split_tree<'a>(
             ratio: _,
             ..
         } => {
-            let first_el =
-                render_split_tree(first, terminals, focused_pane, bytes_received);
-            let second_el =
-                render_split_tree(second, terminals, focused_pane, bytes_received);
+            let first_el = render_split_tree(
+                first,
+                terminals,
+                focused_pane,
+                bytes_received,
+                selections,
+            );
+            let second_el = render_split_tree(
+                second,
+                terminals,
+                focused_pane,
+                bytes_received,
+                selections,
+            );
 
             let divider_style = |_t: &Theme| container::Style {
                 background: Some(theme::BORDER.into()),

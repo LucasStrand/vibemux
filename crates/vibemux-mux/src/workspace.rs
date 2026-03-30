@@ -1,3 +1,4 @@
+use crate::pane::PaneId;
 use crate::split::SplitTree;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -6,9 +7,6 @@ pub type WorkspaceId = Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceMetadata {
-    pub cwd: Option<String>,
-    pub git_branch: Option<String>,
-    pub title: Option<String>,
     #[serde(default)]
     pub status_entries: Vec<StatusEntry>,
     pub progress: Option<ProgressState>,
@@ -40,9 +38,6 @@ pub struct LogEntry {
 impl Default for WorkspaceMetadata {
     fn default() -> Self {
         Self {
-            cwd: None,
-            git_branch: None,
-            title: None,
             status_entries: Vec::new(),
             progress: None,
             log_entries: Vec::new(),
@@ -50,10 +45,40 @@ impl Default for WorkspaceMetadata {
     }
 }
 
+/// One shell session (WezTerm-style tab) inside a workspace.
+pub struct WorkspaceTab {
+    pub id: Uuid,
+    pub split_tree: SplitTree,
+    pub cwd: Option<String>,
+    pub git_branch: Option<String>,
+    pub title: Option<String>,
+}
+
+impl WorkspaceTab {
+    pub fn new() -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            split_tree: SplitTree::empty(),
+            cwd: None,
+            git_branch: None,
+            title: None,
+        }
+    }
+
+    pub fn label(&self, index: usize) -> String {
+        let n = index + 1;
+        match &self.title {
+            Some(t) if !t.is_empty() => format!("{n}: {t}"),
+            _ => format!("{n}: shell"),
+        }
+    }
+}
+
 pub struct Workspace {
     pub id: WorkspaceId,
     pub name: String,
-    pub split_tree: SplitTree,
+    pub tabs: Vec<WorkspaceTab>,
+    pub active_tab_index: usize,
     pub metadata: WorkspaceMetadata,
     pub has_unread: bool,
     pub pinned: bool,
@@ -64,11 +89,35 @@ impl Workspace {
         Self {
             id: Uuid::new_v4(),
             name: name.into(),
-            split_tree: SplitTree::empty(),
+            tabs: vec![WorkspaceTab::new()],
+            active_tab_index: 0,
             metadata: WorkspaceMetadata::default(),
             has_unread: false,
             pinned: false,
         }
+    }
+
+    pub fn active_tab(&self) -> &WorkspaceTab {
+        &self.tabs[self.active_tab_index]
+    }
+
+    pub fn active_tab_mut(&mut self) -> &mut WorkspaceTab {
+        &mut self.tabs[self.active_tab_index]
+    }
+
+    pub fn split_tree(&self) -> &SplitTree {
+        &self.active_tab().split_tree
+    }
+
+    pub fn split_tree_mut(&mut self) -> &mut SplitTree {
+        &mut self.active_tab_mut().split_tree
+    }
+
+    pub fn all_pane_ids(&self) -> Vec<PaneId> {
+        self.tabs
+            .iter()
+            .flat_map(|t| t.split_tree.pane_ids())
+            .collect()
     }
 }
 
@@ -104,6 +153,20 @@ impl WorkspaceManager {
 
     pub fn workspaces_mut(&mut self) -> &mut Vec<Workspace> {
         &mut self.workspaces
+    }
+
+    /// Returns `(workspace_index, tab_index)` for the pane, if any.
+    pub fn locate_pane(&self, pane_id: PaneId) -> Option<(usize, usize)> {
+        for (wi, ws) in self.workspaces.iter().enumerate() {
+            for (ti, tab) in ws.tabs.iter().enumerate() {
+                if let Some(root) = &tab.split_tree.root {
+                    if root.find_pane(pane_id) {
+                        return Some((wi, ti));
+                    }
+                }
+            }
+        }
+        None
     }
 
     pub fn create_workspace(&mut self, name: impl Into<String>) -> WorkspaceId {

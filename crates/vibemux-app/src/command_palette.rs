@@ -35,6 +35,51 @@ impl CommandPalette {
                 message: Message::CreateWorkspace,
             },
             CommandEntry {
+                label: "Copy terminal selection".into(),
+                shortcut: Some("Ctrl+Shift+C".into()),
+                message: Message::CopyTerminalSelection,
+            },
+            CommandEntry {
+                label: "Paste into terminal".into(),
+                shortcut: Some("Ctrl+Shift+V".into()),
+                message: Message::RequestClipboardPaste,
+            },
+            CommandEntry {
+                label: "Select all terminal input".into(),
+                shortcut: Some("Ctrl+Shift+A".into()),
+                message: Message::SelectAllTerminalInput,
+            },
+            CommandEntry {
+                label: "Cut terminal selection".into(),
+                shortcut: Some("Ctrl+Shift+X".into()),
+                message: Message::CutTerminalSelection,
+            },
+            CommandEntry {
+                label: "Toggle find in terminal".into(),
+                shortcut: Some("Ctrl+Shift+F".into()),
+                message: Message::ToggleFindBar,
+            },
+            CommandEntry {
+                label: "New Tab".into(),
+                shortcut: Some("Ctrl+Shift+T".into()),
+                message: Message::NewTab,
+            },
+            CommandEntry {
+                label: "Close Tab".into(),
+                shortcut: Some("Ctrl+F4".into()),
+                message: Message::CloseActiveTab,
+            },
+            CommandEntry {
+                label: "Next Tab".into(),
+                shortcut: Some("Ctrl+PgDn".into()),
+                message: Message::NextTab,
+            },
+            CommandEntry {
+                label: "Previous Tab".into(),
+                shortcut: Some("Ctrl+PgUp".into()),
+                message: Message::PrevTab,
+            },
+            CommandEntry {
                 label: "Split Right".into(),
                 shortcut: Some("Ctrl+Shift+D".into()),
                 message: Message::SplitRight,

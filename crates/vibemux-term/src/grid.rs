@@ -127,6 +127,30 @@ impl TerminalGrid {
         &self.cells
     }
 
+    /// Lines from top (oldest scrollback) through the active screen (bottom).
+    pub fn display_line_count(&self) -> usize {
+        self.scrollback.len() + self.rows
+    }
+
+    pub fn display_line_cells(&self, display_row: usize) -> Option<&[Cell]> {
+        let sb = self.scrollback.len();
+        if display_row < sb {
+            Some(self.scrollback[display_row].as_slice())
+        } else {
+            let r = display_row - sb;
+            if r < self.rows {
+                Some(self.cells[r].as_slice())
+            } else {
+                None
+            }
+        }
+    }
+
+    /// Cursor row in the combined scrollback + screen coordinates.
+    pub fn display_cursor_row(&self) -> usize {
+        self.scrollback.len() + self.cursor_row
+    }
+
     fn scroll_up(&mut self) {
         if !self.cells.is_empty() {
             let line = self.cells.remove(0);
@@ -168,32 +192,40 @@ impl TerminalGrid {
         self.cursor_col = 0;
     }
 
+    /// Destructive backspace: move left and clear the cell we move onto. Hosts that
+    /// echo `\b` without `\b \b` otherwise leave stale glyphs; ConPTY/readline often
+    /// rely on this or on EL/ECH for the rest of the line.
     fn backspace(&mut self) {
-        if self.cursor_col > 0 {
+        if self.cursor_col > 0 && self.cursor_row < self.rows {
             self.cursor_col -= 1;
+            self.cells[self.cursor_row][self.cursor_col] = Cell::default();
         }
     }
 
     fn erase_in_display(&mut self, mode: u16) {
+        if self.rows == 0 {
+            return;
+        }
+        let r = self.cursor_row.min(self.rows - 1);
         match mode {
             0 => {
                 for col in self.cursor_col..self.cols {
-                    self.cells[self.cursor_row][col] = Cell::default();
+                    self.cells[r][col] = Cell::default();
                 }
-                for row in (self.cursor_row + 1)..self.rows {
+                for row in (r + 1)..self.rows {
                     for col in 0..self.cols {
                         self.cells[row][col] = Cell::default();
                     }
                 }
             }
             1 => {
-                for row in 0..self.cursor_row {
+                for row in 0..r {
                     for col in 0..self.cols {
                         self.cells[row][col] = Cell::default();
                     }
                 }
                 for col in 0..=self.cursor_col.min(self.cols - 1) {
-                    self.cells[self.cursor_row][col] = Cell::default();
+                    self.cells[r][col] = Cell::default();
                 }
             }
             2 | 3 => {
@@ -208,23 +240,42 @@ impl TerminalGrid {
     }
 
     fn erase_in_line(&mut self, mode: u16) {
+        if self.rows == 0 {
+            return;
+        }
+        let r = self.cursor_row.min(self.rows - 1);
         match mode {
             0 => {
                 for col in self.cursor_col..self.cols {
-                    self.cells[self.cursor_row][col] = Cell::default();
+                    self.cells[r][col] = Cell::default();
                 }
             }
             1 => {
                 for col in 0..=self.cursor_col.min(self.cols - 1) {
-                    self.cells[self.cursor_row][col] = Cell::default();
+                    self.cells[r][col] = Cell::default();
                 }
             }
             2 => {
                 for col in 0..self.cols {
-                    self.cells[self.cursor_row][col] = Cell::default();
+                    self.cells[r][col] = Cell::default();
                 }
             }
             _ => {}
+        }
+    }
+
+    /// ECMA-48 ECH — erase `n` cells with blanks without moving the cursor (CSI n X).
+    fn erase_chars(&mut self, n: usize) {
+        if self.rows == 0 || n == 0 {
+            return;
+        }
+        let r = self.cursor_row.min(self.rows - 1);
+        let c0 = self.cursor_col.min(self.cols.saturating_sub(1));
+        for i in 0..n {
+            let c = c0 + i;
+            if c < self.cols {
+                self.cells[r][c] = Cell::default();
+            }
         }
     }
 
@@ -372,6 +423,8 @@ impl vte::Perform for VteHandler<'_> {
             b'\n' => self.grid.newline(),
             b'\r' => self.grid.carriage_return(),
             b'\x08' => self.grid.backspace(),
+            // Windows / xterm often send DEL for backspace in the echo stream too.
+            b'\x7f' => self.grid.backspace(),
             b'\t' => {
                 let next_tab = (self.grid.cursor_col + 8) & !7;
                 self.grid.cursor_col = next_tab.min(self.grid.cols - 1);
@@ -437,9 +490,12 @@ impl vte::Perform for VteHandler<'_> {
         &mut self,
         params: &vte::Params,
         intermediates: &[u8],
-        _ignore: bool,
+        ignore: bool,
         action: char,
     ) {
+        if ignore {
+            return;
+        }
         let params_vec: Vec<u16> = params.iter().flat_map(|p| p.iter().copied()).collect();
         let p0 = params_vec.first().copied().unwrap_or(0);
         let p1 = if params_vec.len() > 1 { params_vec[1] } else { 0 };
@@ -503,6 +559,11 @@ impl vte::Perform for VteHandler<'_> {
             }
             'J' => self.grid.erase_in_display(p0),
             'K' => self.grid.erase_in_line(p0),
+            // Erase Character (ECH): used by ConPTY/readline-style redraws.
+            'X' if intermediates.is_empty() => {
+                let n = p0.max(1) as usize;
+                self.grid.erase_chars(n);
+            }
             'm' => {
                 if params_vec.is_empty() {
                     self.grid.set_sgr(&[0]);

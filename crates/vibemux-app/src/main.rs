@@ -6,7 +6,9 @@ mod notifications;
 mod pty_stream;
 mod session;
 mod sidebar;
+mod term_selection;
 mod split_view;
+mod tab_bar;
 mod term_view;
 mod theme;
 

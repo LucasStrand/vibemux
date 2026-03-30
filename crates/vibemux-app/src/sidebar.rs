@@ -20,18 +20,27 @@ pub fn view<'a>(manager: &'a WorkspaceManager) -> Element<'a, Message> {
 
         let name_text = text(&ws.name).size(13).color(name_color);
 
-        let meta_str = if let Some(ref branch) = ws.metadata.git_branch {
-            branch.clone()
-        } else if let Some(ref cwd) = ws.metadata.cwd {
-            cwd.rsplit(['/', '\\'])
-                .next()
-                .unwrap_or(cwd)
-                .to_string()
+        let shell_tab = ws
+            .tabs
+            .get(ws.active_tab_index)
+            .or_else(|| ws.tabs.first());
+
+        let meta_str = if let Some(t) = shell_tab {
+            if let Some(ref branch) = t.git_branch {
+                branch.clone()
+            } else if let Some(ref cwd) = t.cwd {
+                cwd.rsplit(['/', '\\'])
+                    .next()
+                    .unwrap_or(cwd)
+                    .to_string()
+            } else {
+                String::new()
+            }
         } else {
             String::new()
         };
 
-        let meta_color = if ws.metadata.git_branch.is_some() {
+        let meta_color = if shell_tab.and_then(|t| t.git_branch.as_ref()).is_some() {
             theme::ACCENT_GREEN
         } else {
             theme::FG_DIM
@@ -72,15 +81,12 @@ pub fn view<'a>(manager: &'a WorkspaceManager) -> Element<'a, Message> {
                 badge,
             ]
             .spacing(2);
+            let branch_str = shell_tab
+                .and_then(|t| t.git_branch.clone())
+                .unwrap_or_default();
             content = column![
                 name_row,
-                text(if let Some(ref branch) = ws.metadata.git_branch {
-                    branch.clone()
-                } else {
-                    String::new()
-                })
-                .size(11)
-                .color(meta_color),
+                text(branch_str).size(11).color(meta_color),
             ]
             .spacing(2);
         }
