@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use uuid::Uuid;
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct AppNotification {
     pub id: Uuid,
@@ -72,10 +73,12 @@ impl NotificationManager {
         self.unread_count_for(workspace_id) > 0
     }
 
+    #[allow(dead_code)]
     pub fn recent(&self, limit: usize) -> Vec<&AppNotification> {
         self.notifications.iter().take(limit).collect()
     }
 
+    #[allow(dead_code)]
     pub fn clear_all(&mut self) {
         self.notifications.clear();
     }

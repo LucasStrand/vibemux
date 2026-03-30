@@ -4,17 +4,14 @@ use std::sync::{Arc, Mutex};
 
 pub struct PtyReader {
     buffer: Arc<Mutex<VecDeque<Vec<u8>>>>,
-    alive: Arc<Mutex<bool>>,
 }
 
 impl PtyReader {
     pub fn spawn(reader: Arc<Mutex<Box<dyn Read + Send>>>) -> Self {
         let buffer: Arc<Mutex<VecDeque<Vec<u8>>>> =
             Arc::new(Mutex::new(VecDeque::new()));
-        let alive = Arc::new(Mutex::new(true));
 
         let buf_clone = Arc::clone(&buffer);
-        let alive_clone = Arc::clone(&alive);
 
         std::thread::spawn(move || {
             let mut read_buf = [0u8; 8192];
@@ -35,11 +32,9 @@ impl PtyReader {
                     buf.push_back(read_buf[..n].to_vec());
                 }
             }
-
-            *alive_clone.lock().unwrap() = false;
         });
 
-        Self { buffer, alive }
+        Self { buffer }
     }
 
     pub fn drain(&self) -> Vec<u8> {
@@ -49,9 +44,5 @@ impl PtyReader {
             result.extend_from_slice(&chunk);
         }
         result
-    }
-
-    pub fn is_alive(&self) -> bool {
-        *self.alive.lock().unwrap()
     }
 }

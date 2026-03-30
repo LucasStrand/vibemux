@@ -51,6 +51,7 @@ impl SessionState {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn load() -> anyhow::Result<Self> {
         let path = Self::session_path();
         if !path.exists() {

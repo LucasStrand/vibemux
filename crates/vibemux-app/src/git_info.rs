@@ -7,10 +7,3 @@ pub fn detect_git_branch(cwd: &str) -> Option<String> {
     let branch = head.shorthand()?;
     Some(branch.to_string())
 }
-
-pub fn get_cwd_short(cwd: &str) -> String {
-    cwd.rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(cwd)
-        .to_string()
-}

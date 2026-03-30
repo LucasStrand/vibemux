@@ -1,6 +1,5 @@
 use crate::protocol::{Request, Response};
-use serde_json::json;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
 pub enum AppCommand {
     ListWorkspaces {

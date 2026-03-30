@@ -44,6 +44,8 @@ pub struct VibeMux {
     selection_drag_moved: bool,
 }
 
+// Variants are handled in `update`; some are reserved for subscriptions / shortcuts not wired yet.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum Message {
     CreateWorkspace,
