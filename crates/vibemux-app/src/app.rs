@@ -218,7 +218,7 @@ impl VibeMux {
     }
 
     pub fn theme(&self) -> Theme {
-        Theme::CatppuccinMocha
+        Theme::Dark
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {

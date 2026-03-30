@@ -42,44 +42,20 @@ fn line_element<'a>(
     let range_sel = selection.filter(|s| !s.collapsed());
 
     let mut spans: Vec<Span<'a, (), Font>> = Vec::new();
-    let mut i = 0;
-    while i < row_cells.len().min(cols) {
+    for c in 0..row_cells.len().min(cols) {
         let selected = range_sel
-            .map(|s| s.contains_cell(row_idx, i, cols))
+            .map(|s| s.contains_cell(row_idx, c, cols))
             .unwrap_or(false);
+        let is_cursor = is_cursor_row && c == v_col && grid.cursor_visible;
+        let ch = if is_cursor { '\u{2588}' } else { row_cells[c].c };
 
-        let start = i;
-        while i < row_cells.len().min(cols) {
-            let sel = range_sel
-                .map(|s| s.contains_cell(row_idx, i, cols))
-                .unwrap_or(false);
-            if sel != selected {
-                break;
-            }
-            i += 1;
-        }
+        let fg = Color::from_rgb(
+            row_cells[c].attrs.fg.r as f32 / 255.0,
+            row_cells[c].attrs.fg.g as f32 / 255.0,
+            row_cells[c].attrs.fg.b as f32 / 255.0,
+        );
 
-        let mut frag = String::new();
-        for c in start..i {
-            let is_cursor = is_cursor_row && c == v_col && grid.cursor_visible;
-            if is_cursor {
-                frag.push('\u{2588}');
-            } else {
-                frag.push(row_cells[c].c);
-            }
-        }
-
-        let fg = if is_cursor_row && grid.cursor_visible {
-            theme::FG_PRIMARY
-        } else {
-            Color::from_rgb(
-                row_cells[start].attrs.fg.r as f32 / 255.0,
-                row_cells[start].attrs.fg.g as f32 / 255.0,
-                row_cells[start].attrs.fg.b as f32 / 255.0,
-            )
-        };
-
-        let mut s = span(frag)
+        let mut s = span(ch.to_string())
             .size(TERM_FONT_SIZE)
             .font(Font::MONOSPACE)
             .color(fg);
