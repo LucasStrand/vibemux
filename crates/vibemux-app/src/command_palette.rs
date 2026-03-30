@@ -1,7 +1,12 @@
 use crate::app::Message;
 use crate::theme;
-use iced::widget::{column, container, scrollable, text, text_input, Column};
-use iced::{Border, Color, Element, Fill, Length, Padding, Theme};
+use iced::widget::operation::{self, RelativeOffset};
+use iced::widget::{column, container, scrollable, text, text_input, Column, Id};
+use iced::{Border, Color, Element, Fill, Length, Padding, Task, Theme};
+
+pub fn scroll_id() -> Id {
+    Id::from("command-palette-scroll")
+}
 
 #[derive(Debug, Clone)]
 pub struct CommandEntry {
@@ -15,6 +20,8 @@ pub struct CommandPalette {
     pub query: String,
     commands: Vec<CommandEntry>,
     pub selected_index: usize,
+    /// First visible row index in the list (for scroll position).
+    list_scroll_anchor: usize,
 }
 
 impl CommandPalette {
@@ -24,8 +31,12 @@ impl CommandPalette {
             query: String::new(),
             commands: Self::all_commands(),
             selected_index: 0,
+            list_scroll_anchor: 0,
         }
     }
+
+    /// ~8 rows visible in the fixed-height list (see `view` scroll height / row padding).
+    const VISIBLE_ROWS: usize = 8;
 
     fn all_commands() -> Vec<CommandEntry> {
         vec![
@@ -122,17 +133,20 @@ impl CommandPalette {
         if self.visible {
             self.query.clear();
             self.selected_index = 0;
+            self.list_scroll_anchor = 0;
         }
     }
 
     pub fn close(&mut self) {
         self.visible = false;
         self.query.clear();
+        self.list_scroll_anchor = 0;
     }
 
     pub fn set_query(&mut self, query: String) {
         self.query = query;
         self.selected_index = 0;
+        self.list_scroll_anchor = 0;
     }
 
     pub fn select_up(&mut self) {
@@ -169,6 +183,36 @@ impl CommandPalette {
             .iter()
             .filter(|cmd| fuzzy_match(&cmd.label, &q))
             .collect()
+    }
+
+    /// Updates scroll only when the selection moves outside the visible window, or when `force` is set
+    /// (e.g. open palette or filter text changed).
+    pub fn scroll_list_to_selection_task(&mut self, force: bool) -> Task<Message> {
+        let n = self.filtered_commands().len();
+        if n == 0 {
+            return Task::none();
+        }
+        let vr = Self::VISIBLE_ROWS;
+        let max_anchor = n.saturating_sub(vr);
+        let mut anchor = self.list_scroll_anchor.min(max_anchor);
+        if self.selected_index < anchor {
+            anchor = self.selected_index;
+        }
+        if vr > 0 && n > vr && self.selected_index >= anchor + vr {
+            anchor = self.selected_index + 1 - vr;
+        }
+        anchor = anchor.min(max_anchor);
+        let changed = anchor != self.list_scroll_anchor;
+        self.list_scroll_anchor = anchor;
+        if !force && !changed {
+            return Task::none();
+        }
+        let y = if max_anchor == 0 {
+            0.0
+        } else {
+            (anchor as f32 / max_anchor as f32).clamp(0.0, 1.0)
+        };
+        operation::snap_to(scroll_id(), RelativeOffset { x: 0.0, y })
     }
 
     pub fn view(&self) -> Element<'_, Message> {
@@ -218,7 +262,10 @@ impl CommandPalette {
 
         let palette = column![
             input,
-            scrollable(items).height(Length::Fixed(300.0)),
+            scrollable(items)
+                .id(scroll_id())
+                .width(Fill)
+                .height(Length::Fixed(300.0)),
         ]
         .width(Length::Fixed(500.0));
 

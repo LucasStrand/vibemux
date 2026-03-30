@@ -1,15 +1,16 @@
 use std::collections::VecDeque;
 use uuid::Uuid;
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct AppNotification {
+    #[allow(dead_code)]
     pub id: Uuid,
     pub workspace_id: Uuid,
     pub title: String,
     pub body: String,
     pub subtitle: Option<String>,
     pub read: bool,
+    #[allow(dead_code)]
     pub timestamp: std::time::Instant,
 }
 
@@ -76,6 +77,11 @@ impl NotificationManager {
     #[allow(dead_code)]
     pub fn recent(&self, limit: usize) -> Vec<&AppNotification> {
         self.notifications.iter().take(limit).collect()
+    }
+
+    /// Newest-first (same order as internal deque).
+    pub fn iter_chronological(&self) -> impl Iterator<Item = &AppNotification> + '_ {
+        self.notifications.iter()
     }
 
     #[allow(dead_code)]

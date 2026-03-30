@@ -8,13 +8,15 @@ use crate::term_selection::{
     input_start_column, logical_line_end_col, move_cell as sel_move_cell, point_to_cell,
     selection_text, TerminalSelection,
 };
-use crate::{sidebar, split_view, tab_bar, theme};
+use crate::term_selection::{TERM_CHAR_WIDTH, TERM_LINE_HEIGHT};
+use crate::{notification_panel, resize_layout, sidebar, split_view, tab_bar, theme};
 use iced::clipboard;
 use iced::keyboard;
 use iced::mouse;
 use iced::widget::operation;
 use iced::widget::{column, container, row, text};
-use iced::{event, Element, Fill, Length, Point, Subscription, Task, Theme};
+use iced::{event, Element, Fill, Length, Point, Size, Subscription, Task, Theme};
+use iced::window;
 use std::collections::HashMap;
 use uuid::Uuid;
 use vibemux_mux::{Pane, PaneId, SplitTree, WorkspaceManager, WorkspaceTab};
@@ -30,6 +32,8 @@ pub struct VibeMux {
     ipc_rx: std::sync::mpsc::Receiver<vibemux_ipc::AppCommand>,
     next_workspace_num: usize,
     show_notification_panel: bool,
+    /// Last reported window size; used to resize PTYs when the layout changes.
+    last_window_size: Option<Size>,
     last_session_save: std::time::Instant,
     bytes_received: usize,
     /// When true, new PTY output snaps the terminal scroll view to the bottom.
@@ -94,6 +98,7 @@ pub enum Message {
     TerminalExtendSelection { delta_row: i32, delta_col: i32 },
     TerminalExtendSelectionLineStart,
     TerminalExtendSelectionLineEnd,
+    WindowResized(Size),
 }
 
 impl VibeMux {
@@ -156,28 +161,106 @@ impl VibeMux {
             });
         });
 
-        (
-            Self {
-                workspace_manager: manager,
-                terminals,
-                pty_readers,
-                notification_manager: NotificationManager::new(),
-                command_palette: CommandPalette::new(),
-                find_bar: FindBar::new(),
-                ipc_rx,
-                next_workspace_num: 2,
-                show_notification_panel: false,
-                last_session_save: std::time::Instant::now(),
-                bytes_received: 0,
-                terminal_stick_to_bottom: HashMap::from([(pane_id, true)]),
-                terminal_selection: HashMap::new(),
-                terminal_pointer_local: HashMap::new(),
-                selection_drag_pane: None,
-                selection_pending_anchor: None,
-                selection_drag_moved: false,
-            },
-            Task::none(),
-        )
+        let mut app = Self {
+            workspace_manager: manager,
+            terminals,
+            pty_readers,
+            notification_manager: NotificationManager::new(),
+            command_palette: CommandPalette::new(),
+            find_bar: FindBar::new(),
+            ipc_rx,
+            next_workspace_num: 2,
+            show_notification_panel: false,
+            last_window_size: Some(Size::new(1200.0, 800.0)),
+            last_session_save: std::time::Instant::now(),
+            bytes_received: 0,
+            terminal_stick_to_bottom: HashMap::from([(pane_id, true)]),
+            terminal_selection: HashMap::new(),
+            terminal_pointer_local: HashMap::new(),
+            selection_drag_pane: None,
+            selection_pending_anchor: None,
+            selection_drag_moved: false,
+        };
+        app.resize_terminals_from_window();
+        let tabs_snap = app.snap_shell_tabs_task();
+        (app, tabs_snap)
+    }
+
+    fn sync_notification_badges(&mut self) {
+        let ws_ids: Vec<Uuid> = self
+            .workspace_manager
+            .workspaces()
+            .iter()
+            .map(|w| w.id)
+            .collect();
+        for ws_id in ws_ids {
+            let has_unread = self.notification_manager.has_unread(ws_id);
+            if let Some(ws) = self
+                .workspace_manager
+                .workspaces_mut()
+                .iter_mut()
+                .find(|w| w.id == ws_id)
+            {
+                ws.has_unread = has_unread;
+            }
+        }
+    }
+
+    fn resize_terminals_from_window(&mut self) {
+        const SIDEBAR_W: f32 = 220.0;
+        const MAIN_DIVIDER: f32 = 1.0;
+        const TAB_BAR_H: f32 = 44.0;
+        const FIND_BAR_H: f32 = 48.0;
+        const NOTIF_PANEL_W: f32 = 280.0;
+        const NOTIF_DIVIDER: f32 = 1.0;
+        const TERM_SCROLL_PAD: f32 = 8.0;
+        const STATUS_BAR_H: f32 = 24.0;
+
+        let Some(size) = self.last_window_size else {
+            return;
+        };
+
+        let mut content_w = size.width - SIDEBAR_W - MAIN_DIVIDER;
+        if self.show_notification_panel {
+            content_w -= NOTIF_PANEL_W + NOTIF_DIVIDER;
+        }
+        let mut content_h = size.height - TAB_BAR_H;
+        if self.find_bar.visible {
+            content_h -= FIND_BAR_H;
+        }
+        if content_w < 80.0 || content_h < 80.0 {
+            return;
+        }
+
+        let mut work: Vec<(PaneId, f32, f32)> = Vec::new();
+        for ws in self.workspace_manager.workspaces() {
+            for tab in &ws.tabs {
+                if let Some(root) = &tab.split_tree.root {
+                    work.extend(resize_layout::pane_content_sizes(
+                        root,
+                        content_w,
+                        content_h,
+                    ));
+                }
+            }
+        }
+
+        for (pane_id, pw, ph) in work {
+            let scroll_h = (ph - STATUS_BAR_H).max(TERM_LINE_HEIGHT);
+            let cols_f = ((pw - TERM_SCROLL_PAD) / TERM_CHAR_WIDTH).floor();
+            let rows_f =
+                ((scroll_h - TERM_SCROLL_PAD) / TERM_LINE_HEIGHT).floor();
+            let cols = cols_f.clamp(1.0, 512.0) as u16;
+            let rows = rows_f.clamp(1.0, 256.0) as u16;
+
+            if let Some(term) = self.terminals.get_mut(&pane_id) {
+                if term.grid.cols != cols as usize || term.grid.rows != rows as usize {
+                    if let Err(e) = term.resize(rows, cols) {
+                        log::warn!("terminal resize failed for pane {pane_id:?}: {e}");
+                    }
+                }
+            }
+        }
     }
 
     fn spawn_terminal(&mut self, pane_id: PaneId) {
@@ -207,6 +290,10 @@ impl VibeMux {
         }
     }
 
+    fn snap_shell_tabs_task(&self) -> Task<Message> {
+        tab_bar::snap_active_tab_scroll_task(self.workspace_manager.active())
+    }
+
     pub fn title(&self) -> String {
         let ws = self.workspace_manager.active();
         let tab = ws.active_tab();
@@ -223,6 +310,10 @@ impl VibeMux {
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::WindowResized(size) => {
+                self.last_window_size = Some(size);
+                self.resize_terminals_from_window();
+            }
             Message::CreateWorkspace => {
                 let name = format!("Workspace {}", self.next_workspace_num);
                 self.next_workspace_num += 1;
@@ -235,6 +326,8 @@ impl VibeMux {
                     .active_tab_mut()
                     .split_tree = SplitTree::with_pane(pane_id);
                 self.spawn_terminal(pane_id);
+                self.resize_terminals_from_window();
+                return self.snap_shell_tabs_task();
             }
             Message::CloseWorkspace(id) => {
                 let pane_ids: Vec<PaneId> = self
@@ -249,16 +342,21 @@ impl VibeMux {
                     self.remove_terminal(pid);
                 }
                 self.workspace_manager.close_workspace(id);
+                self.resize_terminals_from_window();
+                return self.snap_shell_tabs_task();
             }
             Message::SelectWorkspace(id) => {
                 self.workspace_manager.select_workspace(id);
                 self.notification_manager.mark_workspace_read(id);
+                return self.snap_shell_tabs_task();
             }
             Message::NextWorkspace => {
                 self.workspace_manager.next_workspace();
+                return self.snap_shell_tabs_task();
             }
             Message::PrevWorkspace => {
                 self.workspace_manager.prev_workspace();
+                return self.snap_shell_tabs_task();
             }
             Message::SplitRight => {
                 let pane = Pane::new();
@@ -266,6 +364,7 @@ impl VibeMux {
                 let tree = self.workspace_manager.active_mut().split_tree_mut();
                 tree.split(pane_id, vibemux_mux::SplitDirection::Vertical);
                 self.spawn_terminal(pane_id);
+                self.resize_terminals_from_window();
             }
             Message::SplitDown => {
                 let pane = Pane::new();
@@ -273,6 +372,7 @@ impl VibeMux {
                 let tree = self.workspace_manager.active_mut().split_tree_mut();
                 tree.split(pane_id, vibemux_mux::SplitDirection::Horizontal);
                 self.spawn_terminal(pane_id);
+                self.resize_terminals_from_window();
             }
             Message::TerminalOutput(pane_id, data) => {
                 if let Some(terminal) = self.terminals.get_mut(&pane_id) {
@@ -318,6 +418,7 @@ impl VibeMux {
                     if tree.pane_ids().len() > 1 {
                         tree.remove_pane(focused);
                         self.remove_terminal(focused);
+                        self.resize_terminals_from_window();
                     }
                 }
             }
@@ -330,6 +431,8 @@ impl VibeMux {
                 ws.tabs.push(tab);
                 ws.active_tab_index = ws.tabs.len() - 1;
                 self.spawn_terminal(pane_id);
+                self.resize_terminals_from_window();
+                return self.snap_shell_tabs_task();
             }
             Message::CloseTab(tab_id) => {
                 let pane_ids = {
@@ -355,6 +458,8 @@ impl VibeMux {
                 for pid in pane_ids {
                     self.remove_terminal(pid);
                 }
+                self.resize_terminals_from_window();
+                return self.snap_shell_tabs_task();
             }
             Message::CloseActiveTab => {
                 let tid = self.workspace_manager.active().active_tab().id;
@@ -365,12 +470,14 @@ impl VibeMux {
                 if let Some(ti) = ws.tabs.iter().position(|t| t.id == tab_id) {
                     ws.active_tab_index = ti;
                 }
+                return self.snap_shell_tabs_task();
             }
             Message::NextTab => {
                 let ws = self.workspace_manager.active_mut();
                 if !ws.tabs.is_empty() {
                     ws.active_tab_index = (ws.active_tab_index + 1) % ws.tabs.len();
                 }
+                return self.snap_shell_tabs_task();
             }
             Message::PrevTab => {
                 let ws = self.workspace_manager.active_mut();
@@ -381,6 +488,7 @@ impl VibeMux {
                         ws.active_tab_index - 1
                     };
                 }
+                return self.snap_shell_tabs_task();
             }
             Message::TerminalViewportChanged(pane_id, stick_to_bottom) => {
                 self.terminal_stick_to_bottom
@@ -520,13 +628,17 @@ impl VibeMux {
                             keyboard::key::Named::ArrowUp,
                         ) => {
                             self.command_palette.select_up();
-                            return Task::none();
+                            return self
+                                .command_palette
+                                .scroll_list_to_selection_task(false);
                         }
                         keyboard::Key::Named(
                             keyboard::key::Named::ArrowDown,
                         ) => {
                             self.command_palette.select_down();
-                            return Task::none();
+                            return self
+                                .command_palette
+                                .scroll_list_to_selection_task(false);
                         }
                         _ => return Task::none(),
                     }
@@ -786,9 +898,16 @@ impl VibeMux {
             }
             Message::ToggleNotificationPanel => {
                 self.show_notification_panel = !self.show_notification_panel;
+                if self.show_notification_panel {
+                    let id = self.workspace_manager.active().id;
+                    self.notification_manager.mark_workspace_read(id);
+                    self.sync_notification_badges();
+                }
+                self.resize_terminals_from_window();
             }
             Message::ToggleFindBar => {
                 self.find_bar.toggle();
+                self.resize_terminals_from_window();
             }
             Message::FindBarInput(query) => {
                 self.find_bar.set_query(query.clone());
@@ -808,15 +927,27 @@ impl VibeMux {
             }
             Message::ToggleCommandPalette => {
                 self.command_palette.toggle();
+                if self.command_palette.visible {
+                    return self
+                        .command_palette
+                        .scroll_list_to_selection_task(true);
+                }
             }
             Message::CommandPaletteInput(query) => {
                 self.command_palette.set_query(query);
+                return self.command_palette.scroll_list_to_selection_task(true);
             }
             Message::CommandPaletteUp => {
                 self.command_palette.select_up();
+                return self
+                    .command_palette
+                    .scroll_list_to_selection_task(false);
             }
             Message::CommandPaletteDown => {
                 self.command_palette.select_down();
+                return self
+                    .command_palette
+                    .scroll_list_to_selection_task(false);
             }
             Message::CommandPaletteConfirm => {
                 if let Some(msg) = self.command_palette.confirm() {
@@ -906,24 +1037,7 @@ impl VibeMux {
                     self.handle_ipc_command(cmd);
                 }
 
-                let ws_ids: Vec<Uuid> = self
-                    .workspace_manager
-                    .workspaces()
-                    .iter()
-                    .map(|w| w.id)
-                    .collect();
-                for ws_id in ws_ids {
-                    let has_unread =
-                        self.notification_manager.has_unread(ws_id);
-                    if let Some(ws) = self
-                        .workspace_manager
-                        .workspaces_mut()
-                        .iter_mut()
-                        .find(|w| w.id == ws_id)
-                    {
-                        ws.has_unread = has_unread;
-                    }
-                }
+                self.sync_notification_badges();
 
                 if self.last_session_save.elapsed()
                     > std::time::Duration::from_secs(30)
@@ -985,11 +1099,32 @@ impl VibeMux {
             content
         };
 
-        let main_layout: Element<'_, Message> =
+        let panel_divider = container(text(""))
+            .width(Length::Fixed(1.0))
+            .height(Fill)
+            .style(|_t: &Theme| iced::widget::container::Style {
+                background: Some(theme::BORDER.into()),
+                ..Default::default()
+            });
+
+        let main_layout: Element<'_, Message> = if self.show_notification_panel
+        {
+            row![
+                sidebar,
+                divider,
+                content_with_find,
+                panel_divider,
+                notification_panel::view(&self.notification_manager),
+            ]
+            .width(Fill)
+            .height(Fill)
+            .into()
+        } else {
             row![sidebar, divider, content_with_find]
                 .width(Fill)
                 .height(Fill)
-                .into();
+                .into()
+        };
 
         if self.command_palette.visible {
             let overlay = self.command_palette.view();
@@ -1020,7 +1155,9 @@ impl VibeMux {
                 _ => None,
             });
 
-        Subscription::batch([tick, keys])
+        let resize = window::resize_events().map(|(_, size)| Message::WindowResized(size));
+
+        Subscription::batch([tick, keys, resize])
     }
 
     /// Delete the non-collapsed terminal selection; optionally copy to clipboard (cut).

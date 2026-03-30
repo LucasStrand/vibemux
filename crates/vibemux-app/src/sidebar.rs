@@ -6,8 +6,9 @@ use vibemux_mux::WorkspaceManager;
 
 pub fn view<'a>(manager: &'a WorkspaceManager) -> Element<'a, Message> {
     let active_idx = manager.active_index();
+    let multi = manager.workspaces().len() > 1;
 
-    let mut items = Column::new().spacing(2).padding(Padding::new(6.0));
+    let mut items = Column::new().spacing(2).padding(Padding::from([8.0, 6.0]));
 
     for (i, ws) in manager.workspaces().iter().enumerate() {
         let is_active = i == active_idx;
@@ -48,7 +49,7 @@ pub fn view<'a>(manager: &'a WorkspaceManager) -> Element<'a, Message> {
 
         let mut content = column![
             name_text,
-            text(meta_str).size(11).color(meta_color),
+            text(meta_str.clone()).size(11).color(meta_color),
         ]
         .spacing(2);
 
@@ -61,10 +62,7 @@ pub fn view<'a>(manager: &'a WorkspaceManager) -> Element<'a, Message> {
             }
 
             if let Some(ref progress) = ws.metadata.progress {
-                let label = progress
-                    .label
-                    .as_deref()
-                    .unwrap_or("");
+                let label = progress.label.as_deref().unwrap_or("");
                 let bar = column![
                     text(label).size(10).color(theme::FG_DIM),
                     progress_bar(0.0..=1.0, progress.value),
@@ -75,48 +73,87 @@ pub fn view<'a>(manager: &'a WorkspaceManager) -> Element<'a, Message> {
         }
 
         if ws.has_unread {
-            let badge = text(" *").size(13).color(theme::NOTIFICATION);
+            let badge = text(" \u{2022}").size(13).color(theme::NOTIFICATION);
             let name_row = row![
                 text(&ws.name).size(13).color(name_color),
                 badge,
             ]
             .spacing(2);
-            let branch_str = shell_tab
-                .and_then(|t| t.git_branch.clone())
-                .unwrap_or_default();
             content = column![
                 name_row,
-                text(branch_str).size(11).color(meta_color),
+                text(meta_str.clone()).size(11).color(meta_color),
             ]
             .spacing(2);
+            if is_active {
+                for status in &ws.metadata.status_entries {
+                    let status_text = text(format!("{}: {}", status.key, status.value))
+                        .size(10)
+                        .color(theme::ACCENT);
+                    content = content.push(status_text);
+                }
+                if let Some(ref progress) = ws.metadata.progress {
+                    let label = progress.label.as_deref().unwrap_or("");
+                    let bar = column![
+                        text(label).size(10).color(theme::FG_DIM),
+                        progress_bar(0.0..=1.0, progress.value),
+                    ]
+                    .spacing(2);
+                    content = content.push(bar);
+                }
+            }
         }
 
         let ws_id = ws.id;
-        let btn = button(
-            container(content)
-                .padding(Padding::from([8.0, 10.0]))
-                .width(Fill),
-        )
-        .on_press(Message::SelectWorkspace(ws_id))
-        .width(Fill)
-        .style(move |_t: &iced::Theme, _status| {
-            let bg = if is_active {
-                theme::BG_SURFACE
-            } else {
-                Color::TRANSPARENT
-            };
-            button::Style {
-                background: Some(bg.into()),
+
+        let select_btn = button(content)
+            .on_press(Message::SelectWorkspace(ws_id))
+            .width(Fill)
+            .style(|_t: &iced::Theme, _status| button::Style {
+                background: Some(Color::TRANSPARENT.into()),
                 text_color: theme::FG_PRIMARY,
+                border: Border::default(),
+                ..Default::default()
+            });
+
+        let card_body: Element<'a, Message> = if multi {
+            let close_btn = button(text("\u{00D7}").size(13).color(theme::FG_DIM))
+                .on_press(Message::CloseWorkspace(ws_id))
+                .padding(Padding::from([4.0, 6.0]))
+                .style(|_t: &iced::Theme, _status| button::Style {
+                    background: Some(Color::TRANSPARENT.into()),
+                    text_color: theme::FG_DIM,
+                    border: Border::default(),
+                    ..Default::default()
+                });
+
+            row![select_btn, close_btn]
+                .spacing(0)
+                .align_y(iced::Alignment::Center)
+                .into()
+        } else {
+            select_btn.into()
+        };
+
+        let card = container(card_body)
+            .padding(Padding::from([8.0, 10.0]))
+            .width(Fill)
+            .style(move |_t: &iced::Theme| container::Style {
+                background: Some(
+                    if is_active {
+                        theme::BG_SURFACE
+                    } else {
+                        Color::TRANSPARENT
+                    }
+                    .into(),
+                ),
                 border: Border {
                     radius: 6.0.into(),
                     ..Border::default()
                 },
                 ..Default::default()
-            }
-        });
+            });
 
-        items = items.push(btn);
+        items = items.push(card);
     }
 
     let new_ws_btn = button(
@@ -136,16 +173,7 @@ pub fn view<'a>(manager: &'a WorkspaceManager) -> Element<'a, Message> {
         ..Default::default()
     });
 
-    let header = container(
-        text("VibeMux")
-            .size(16)
-            .color(theme::FG_PRIMARY)
-            .font(iced::Font::with_name("Segoe UI")),
-    )
-    .padding(Padding::from([14.0, 12.0]));
-
     let sidebar_content = column![
-        header,
         scrollable(items).height(Fill),
         container(new_ws_btn).padding(Padding::new(6.0)),
     ]

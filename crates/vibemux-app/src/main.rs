@@ -2,8 +2,10 @@ mod app;
 mod command_palette;
 mod find_bar;
 mod git_info;
+mod notification_panel;
 mod notifications;
 mod pty_stream;
+mod resize_layout;
 mod session;
 mod sidebar;
 mod term_selection;
@@ -21,7 +23,13 @@ fn main() -> iced::Result {
         .title(VibeMux::title)
         .theme(VibeMux::theme)
         .subscription(VibeMux::subscription)
-        .window_size((1200.0, 800.0))
+        .window(
+            iced::window::Settings {
+                size: iced::Size::new(1200.0, 800.0),
+                min_size: Some(iced::Size::new(480.0, 320.0)),
+                ..Default::default()
+            },
+        )
         .antialiasing(true)
         .run()
 }
