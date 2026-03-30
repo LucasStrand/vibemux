@@ -46,7 +46,7 @@ impl CommandPalette {
             },
             CommandEntry {
                 label: "Select all terminal input".into(),
-                shortcut: Some("Ctrl+Shift+A".into()),
+                shortcut: Some("Ctrl+A".into()),
                 message: Message::SelectAllTerminalInput,
             },
             CommandEntry {

@@ -192,13 +192,11 @@ impl TerminalGrid {
         self.cursor_col = 0;
     }
 
-    /// Destructive backspace: move left and clear the cell we move onto. Hosts that
-    /// echo `\b` without `\b \b` otherwise leave stale glyphs; ConPTY/readline often
-    /// rely on this or on EL/ECH for the rest of the line.
+    /// Backspace is cursor motion only; erasing should be performed by explicit
+    /// delete/erase control sequences emitted by the host.
     fn backspace(&mut self) {
-        if self.cursor_col > 0 && self.cursor_row < self.rows {
+        if self.cursor_col > 0 {
             self.cursor_col -= 1;
-            self.cells[self.cursor_row][self.cursor_col] = Cell::default();
         }
     }
 

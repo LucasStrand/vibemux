@@ -698,6 +698,14 @@ impl VibeMux {
 
                 if modifiers.control() && !modifiers.shift() {
                     match &key {
+                        keyboard::Key::Character(c)
+                            if c.as_str().eq_ignore_ascii_case("a")
+                                && !self.command_palette.visible
+                                && !self.find_bar.visible =>
+                        {
+                            self.select_all_terminal_input();
+                            return Task::none();
+                        }
                         keyboard::Key::Named(
                             keyboard::key::Named::Tab,
                         ) => {
