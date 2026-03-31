@@ -8,7 +8,7 @@ pub fn view<'a>(manager: &'a WorkspaceManager) -> Element<'a, Message> {
     let active_idx = manager.active_index();
     let multi = manager.workspaces().len() > 1;
 
-    let mut items = Column::new().spacing(2).padding(Padding::from([8.0, 6.0]));
+    let mut items = Column::new().spacing(2).padding(Padding::from([4.0, 6.0]));
 
     for (i, ws) in manager.workspaces().iter().enumerate() {
         let is_active = i == active_idx;
@@ -175,7 +175,7 @@ pub fn view<'a>(manager: &'a WorkspaceManager) -> Element<'a, Message> {
 
     let sidebar_content = column![
         scrollable(items).height(Fill),
-        container(new_ws_btn).padding(Padding::new(6.0)),
+        container(new_ws_btn).padding(Padding::from([4.0, 6.0])),
     ]
     .height(Fill);
 

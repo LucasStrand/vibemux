@@ -4,7 +4,10 @@
       "Bash(wc -l /c/github/vibemux/crates/vibemux-app/src/*.rs)",
       "Bash(grep -v \"//\")",
       "Bash(cargo build:*)",
-      "Bash(cargo test:*)"
+      "Bash(cargo test:*)",
+      "Bash(grep:*)",
+      "Bash(find /c/github/vibemux/crates -type f \\\\\\(-name *.rs -o -name *.wgsl -o -name *.glsl \\\\\\))",
+      "Bash(cargo check:*)"
     ]
   }
 }

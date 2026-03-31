@@ -1,4 +1,5 @@
 mod app;
+mod box_drawing;
 mod command_palette;
 mod find_bar;
 mod git_info;

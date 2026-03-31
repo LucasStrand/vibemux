@@ -1,8 +1,10 @@
 use crate::app::Message;
-use crate::term_selection::{TerminalSelection, TERM_LINE_HEIGHT};
+use crate::box_drawing::{self, BoxDrawCell, BoxDrawingOverlay};
+use crate::term_selection::{TerminalSelection, TERM_CHAR_WIDTH, TERM_LINE_HEIGHT};
 use crate::theme;
+use iced::widget::canvas;
 use iced::widget::text::{LineHeight, Span};
-use iced::widget::{column, container, mouse_area, rich_text, scrollable, span, Column, Id};
+use iced::widget::{column, container, mouse_area, rich_text, scrollable, span, stack, Column, Id};
 use iced::{Color, Element, Fill, Font, Length, Theme};
 use iced::mouse::Interaction;
 use vibemux_mux::PaneId;
@@ -88,7 +90,9 @@ fn line_element<'a>(
             .map(|s| s.contains_cell(row_idx, c, cols))
             .unwrap_or(false);
         let is_cursor = is_cursor_row && c == v_col && grid.cursor_visible;
-        let ch = if is_cursor { '\u{2588}' } else { row_cells[c].c };
+        let raw_ch = if is_cursor { '\u{2588}' } else { row_cells[c].c };
+        // Replace box-drawing chars with spaces – they'll be drawn on the canvas overlay.
+        let ch = if box_drawing::is_box_drawing(raw_ch) { ' ' } else { raw_ch };
 
         let (fg, cell_bg) = resolve_colors(&row_cells[c].attrs);
         let bg = if selected {
@@ -181,6 +185,7 @@ pub fn view<'a>(
     font_size: f32,
 ) -> Element<'a, Message> {
     let mut lines = Column::new().spacing(0);
+    let mut box_cells: Vec<BoxDrawCell> = Vec::new();
 
     let (v_row, v_col) = visual_cursor(grid, selection);
     let n_lines = grid.display_line_count();
@@ -188,6 +193,24 @@ pub fn view<'a>(
         let Some(row_cells) = grid.display_line_cells(row_idx) else {
             continue;
         };
+
+        // Collect box-drawing characters for the canvas overlay.
+        for c in 0..row_cells.len().min(grid.cols) {
+            if row_cells[c].wide_continuation {
+                continue;
+            }
+            let ch = row_cells[c].c;
+            if box_drawing::is_box_drawing(ch) {
+                let (fg, _bg) = resolve_colors(&row_cells[c].attrs);
+                box_cells.push(BoxDrawCell {
+                    row: row_idx,
+                    col: c,
+                    ch,
+                    color: fg,
+                });
+            }
+        }
+
         lines = lines.push(line_element(
             row_idx,
             row_cells,
@@ -209,6 +232,8 @@ pub fn view<'a>(
             ..Default::default()
         });
 
+    let content_height = n_lines as f32 * TERM_LINE_HEIGHT + 8.0; // +padding
+
     let lines_pane = container(lines)
         .width(Fill)
         .padding(4)
@@ -216,6 +241,26 @@ pub fn view<'a>(
             background: Some(theme::BG_PRIMARY.into()),
             ..Default::default()
         });
+
+    // Overlay a canvas that draws box-drawing characters as geometric primitives.
+    let lines_pane: Element<'a, Message> = if box_cells.is_empty() {
+        lines_pane.into()
+    } else {
+        let overlay = BoxDrawingOverlay {
+            cells: box_cells,
+            cell_width: TERM_CHAR_WIDTH,
+            cell_height: TERM_LINE_HEIGHT,
+            padding: 4.0,
+        };
+        stack![
+            lines_pane,
+            canvas(overlay)
+                .width(Fill)
+                .height(Length::Fixed(content_height))
+        ]
+        .width(Fill)
+        .into()
+    };
 
     let pane_id_move = pane_id;
     let interactive = mouse_area(lines_pane)

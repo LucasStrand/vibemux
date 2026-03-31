@@ -52,11 +52,6 @@ impl FindBar {
         }
     }
 
-    /// Returns the (row, col) of the current match if any.
-    pub fn current_match_pos(&self) -> Option<(usize, usize)> {
-        self.matches.get(self.current_match).copied()
-    }
-
     pub fn view(&self) -> Element<'_, Message> {
         let input = text_input("Find in terminal...", &self.query)
             .on_input(Message::FindBarInput)
