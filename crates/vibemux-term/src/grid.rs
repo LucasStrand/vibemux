@@ -75,6 +75,10 @@ pub struct TerminalGrid {
     pub title: Option<String>,
     /// Queued responses to send back to the PTY
     pub response_queue: Vec<Vec<u8>>,
+    using_alt_screen: bool,
+    saved_primary_screen: Option<SavedScreen>,
+    saved_cursor: Option<(usize, usize)>,
+    wrap_pending: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -84,9 +88,19 @@ pub struct Notification {
     pub subtitle: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct SavedScreen {
+    cells: Vec<Vec<Cell>>,
+    scrollback: Vec<Vec<Cell>>,
+    cursor_row: usize,
+    cursor_col: usize,
+    cursor_visible: bool,
+    wrap_pending: bool,
+}
+
 impl TerminalGrid {
     pub fn new(rows: usize, cols: usize) -> Self {
-        let cells = vec![vec![Cell::default(); cols]; rows];
+        let cells = blank_cells(rows, cols);
         Self {
             cells,
             rows,
@@ -101,22 +115,33 @@ impl TerminalGrid {
             osc_cwd: None,
             title: None,
             response_queue: Vec::new(),
+            using_alt_screen: false,
+            saved_primary_screen: None,
+            saved_cursor: None,
+            wrap_pending: false,
         }
     }
 
     pub fn resize(&mut self, rows: usize, cols: usize) {
         self.rows = rows;
         self.cols = cols;
-        self.cells.resize(rows, vec![Cell::default(); cols]);
-        for row in &mut self.cells {
-            row.resize(cols, Cell::default());
+        resize_screen(
+            &mut self.cells,
+            rows,
+            cols,
+            &mut self.cursor_row,
+            &mut self.cursor_col,
+        );
+        if let Some(saved) = &mut self.saved_primary_screen {
+            resize_screen(
+                &mut saved.cells,
+                rows,
+                cols,
+                &mut saved.cursor_row,
+                &mut saved.cursor_col,
+            );
         }
-        if self.cursor_row >= rows {
-            self.cursor_row = rows.saturating_sub(1);
-        }
-        if self.cursor_col >= cols {
-            self.cursor_col = cols.saturating_sub(1);
-        }
+        self.wrap_pending = false;
     }
 
     pub fn cell(&self, row: usize, col: usize) -> &Cell {
@@ -155,7 +180,7 @@ impl TerminalGrid {
         if !self.cells.is_empty() {
             let line = self.cells.remove(0);
             self.scrollback.push(line);
-            self.cells.push(vec![Cell::default(); self.cols]);
+            self.cells.push(blank_row(self.cols));
             if self.scrollback.len() > 10_000 {
                 self.scrollback.remove(0);
             }
@@ -163,24 +188,24 @@ impl TerminalGrid {
     }
 
     fn put_char(&mut self, c: char) {
+        if self.wrap_pending {
+            self.wrap_to_next_line();
+        }
         if self.cursor_row < self.rows && self.cursor_col < self.cols {
             self.cells[self.cursor_row][self.cursor_col] = Cell {
                 c,
                 attrs: self.current_attrs,
             };
-            self.cursor_col += 1;
-            if self.cursor_col >= self.cols {
-                self.cursor_col = 0;
-                self.cursor_row += 1;
-                if self.cursor_row >= self.rows {
-                    self.scroll_up();
-                    self.cursor_row = self.rows - 1;
-                }
+            if self.cursor_col + 1 >= self.cols {
+                self.wrap_pending = true;
+            } else {
+                self.cursor_col += 1;
             }
         }
     }
 
     fn newline(&mut self) {
+        self.wrap_pending = false;
         self.cursor_row += 1;
         if self.cursor_row >= self.rows {
             self.scroll_up();
@@ -190,13 +215,25 @@ impl TerminalGrid {
 
     fn carriage_return(&mut self) {
         self.cursor_col = 0;
+        self.wrap_pending = false;
     }
 
     /// Backspace is cursor motion only; erasing should be performed by explicit
     /// delete/erase control sequences emitted by the host.
     fn backspace(&mut self) {
+        self.wrap_pending = false;
         if self.cursor_col > 0 {
             self.cursor_col -= 1;
+        }
+    }
+
+    fn wrap_to_next_line(&mut self) {
+        self.wrap_pending = false;
+        self.cursor_col = 0;
+        self.cursor_row += 1;
+        if self.cursor_row >= self.rows {
+            self.scroll_up();
+            self.cursor_row = self.rows.saturating_sub(1);
         }
     }
 
@@ -204,6 +241,7 @@ impl TerminalGrid {
         if self.rows == 0 {
             return;
         }
+        self.wrap_pending = false;
         let r = self.cursor_row.min(self.rows - 1);
         match mode {
             0 => {
@@ -241,6 +279,7 @@ impl TerminalGrid {
         if self.rows == 0 {
             return;
         }
+        self.wrap_pending = false;
         let r = self.cursor_row.min(self.rows - 1);
         match mode {
             0 => {
@@ -267,6 +306,7 @@ impl TerminalGrid {
         if self.rows == 0 || n == 0 {
             return;
         }
+        self.wrap_pending = false;
         let r = self.cursor_row.min(self.rows - 1);
         let c0 = self.cursor_col.min(self.cols.saturating_sub(1));
         for i in 0..n {
@@ -350,6 +390,82 @@ impl TerminalGrid {
 
     fn queue_response(&mut self, data: Vec<u8>) {
         self.response_queue.push(data);
+    }
+
+    fn save_cursor(&mut self) {
+        self.saved_cursor = Some((self.cursor_row, self.cursor_col));
+    }
+
+    fn restore_cursor(&mut self) {
+        if let Some((row, col)) = self.saved_cursor {
+            self.cursor_row = row.min(self.rows.saturating_sub(1));
+            self.cursor_col = col.min(self.cols.saturating_sub(1));
+        }
+        self.wrap_pending = false;
+    }
+
+    fn enter_alternate_screen(&mut self) {
+        if self.using_alt_screen {
+            return;
+        }
+
+        self.saved_primary_screen = Some(SavedScreen {
+            cells: std::mem::take(&mut self.cells),
+            scrollback: std::mem::take(&mut self.scrollback),
+            cursor_row: self.cursor_row,
+            cursor_col: self.cursor_col,
+            cursor_visible: self.cursor_visible,
+            wrap_pending: self.wrap_pending,
+        });
+
+        self.cells = blank_cells(self.rows, self.cols);
+        self.scrollback.clear();
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+        self.cursor_visible = true;
+        self.wrap_pending = false;
+        self.using_alt_screen = true;
+    }
+
+    fn exit_alternate_screen(&mut self) {
+        let Some(saved) = self.saved_primary_screen.take() else {
+            return;
+        };
+
+        self.cells = saved.cells;
+        self.scrollback = saved.scrollback;
+        self.cursor_row = saved.cursor_row.min(self.rows.saturating_sub(1));
+        self.cursor_col = saved.cursor_col.min(self.cols.saturating_sub(1));
+        self.cursor_visible = saved.cursor_visible;
+        self.wrap_pending = saved.wrap_pending;
+        self.using_alt_screen = false;
+    }
+}
+
+fn blank_row(cols: usize) -> Vec<Cell> {
+    vec![Cell::default(); cols]
+}
+
+fn blank_cells(rows: usize, cols: usize) -> Vec<Vec<Cell>> {
+    vec![blank_row(cols); rows]
+}
+
+fn resize_screen(
+    cells: &mut Vec<Vec<Cell>>,
+    rows: usize,
+    cols: usize,
+    cursor_row: &mut usize,
+    cursor_col: &mut usize,
+) {
+    cells.resize(rows, blank_row(cols));
+    for row in cells {
+        row.resize(cols, Cell::default());
+    }
+    if *cursor_row >= rows {
+        *cursor_row = rows.saturating_sub(1);
+    }
+    if *cursor_col >= cols {
+        *cursor_col = cols.saturating_sub(1);
     }
 }
 
@@ -532,24 +648,29 @@ impl vte::Perform for VteHandler<'_> {
                 }
             }
             'A' => {
+                self.grid.wrap_pending = false;
                 let n = p0.max(1) as usize;
                 self.grid.cursor_row = self.grid.cursor_row.saturating_sub(n);
             }
             'B' => {
+                self.grid.wrap_pending = false;
                 let n = p0.max(1) as usize;
                 self.grid.cursor_row =
                     (self.grid.cursor_row + n).min(self.grid.rows.saturating_sub(1));
             }
             'C' => {
+                self.grid.wrap_pending = false;
                 let n = p0.max(1) as usize;
                 self.grid.cursor_col =
                     (self.grid.cursor_col + n).min(self.grid.cols.saturating_sub(1));
             }
             'D' => {
+                self.grid.wrap_pending = false;
                 let n = p0.max(1) as usize;
                 self.grid.cursor_col = self.grid.cursor_col.saturating_sub(n);
             }
             'H' | 'f' => {
+                self.grid.wrap_pending = false;
                 let row = (p0.max(1) - 1) as usize;
                 let col = (p1.max(1) - 1) as usize;
                 self.grid.cursor_row = row.min(self.grid.rows.saturating_sub(1));
@@ -578,7 +699,7 @@ impl vte::Perform for VteHandler<'_> {
                             12 => {} // Cursor blink
                             25 => self.grid.cursor_visible = true,
                             1000 | 1002 | 1003 | 1006 => {} // Mouse tracking
-                            1049 => {} // Alternate screen buffer
+                            1049 => self.grid.enter_alternate_screen(),
                             2004 => {} // Bracketed paste
                             _ => {}
                         }
@@ -594,7 +715,7 @@ impl vte::Perform for VteHandler<'_> {
                             12 => {}
                             25 => self.grid.cursor_visible = false,
                             1000 | 1002 | 1003 | 1006 => {}
-                            1049 => {}
+                            1049 => self.grid.exit_alternate_screen(),
                             2004 => {}
                             _ => {}
                         }
@@ -602,20 +723,25 @@ impl vte::Perform for VteHandler<'_> {
                 }
             }
             'G' => {
+                self.grid.wrap_pending = false;
                 let col = (p0.max(1) - 1) as usize;
                 self.grid.cursor_col = col.min(self.grid.cols.saturating_sub(1));
             }
             'd' => {
+                self.grid.wrap_pending = false;
                 let row = (p0.max(1) - 1) as usize;
                 self.grid.cursor_row = row.min(self.grid.rows.saturating_sub(1));
             }
+            's' => self.grid.save_cursor(),
+            'u' => self.grid.restore_cursor(),
             'L' => {
+                self.grid.wrap_pending = false;
                 let n = p0.max(1) as usize;
                 for _ in 0..n {
                     if self.grid.cursor_row < self.grid.rows {
                         self.grid
                             .cells
-                            .insert(self.grid.cursor_row, vec![Cell::default(); self.grid.cols]);
+                            .insert(self.grid.cursor_row, blank_row(self.grid.cols));
                         if self.grid.cells.len() > self.grid.rows {
                             self.grid.cells.pop();
                         }
@@ -623,15 +749,17 @@ impl vte::Perform for VteHandler<'_> {
                 }
             }
             'M' => {
+                self.grid.wrap_pending = false;
                 let n = p0.max(1) as usize;
                 for _ in 0..n {
                     if self.grid.cursor_row < self.grid.cells.len() {
                         self.grid.cells.remove(self.grid.cursor_row);
-                        self.grid.cells.push(vec![Cell::default(); self.grid.cols]);
+                        self.grid.cells.push(blank_row(self.grid.cols));
                     }
                 }
             }
             'P' => {
+                self.grid.wrap_pending = false;
                 let n = p0.max(1) as usize;
                 let row = self.grid.cursor_row;
                 let col = self.grid.cursor_col;
@@ -645,6 +773,7 @@ impl vte::Perform for VteHandler<'_> {
                 }
             }
             '@' => {
+                self.grid.wrap_pending = false;
                 let n = p0.max(1) as usize;
                 let row = self.grid.cursor_row;
                 let col = self.grid.cursor_col;
@@ -661,5 +790,50 @@ impl vte::Perform for VteHandler<'_> {
         }
     }
 
-    fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, _byte: u8) {}
+    fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, byte: u8) {
+        match byte {
+            b'7' => self.grid.save_cursor(),
+            b'8' => self.grid.restore_cursor(),
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TerminalGrid, VteHandler};
+
+    fn feed(grid: &mut TerminalGrid, bytes: &[u8]) {
+        let mut parser = vte::Parser::new();
+        let mut handler = VteHandler::new(grid);
+        parser.advance(&mut handler, bytes);
+    }
+
+    #[test]
+    fn wraps_only_before_next_print() {
+        let mut grid = TerminalGrid::new(2, 3);
+        feed(&mut grid, b"abc");
+        assert_eq!((grid.cursor_row, grid.cursor_col), (0, 2));
+        assert_eq!(grid.cell(0, 0).c, 'a');
+        assert_eq!(grid.cell(0, 1).c, 'b');
+        assert_eq!(grid.cell(0, 2).c, 'c');
+
+        feed(&mut grid, b"d");
+        assert_eq!((grid.cursor_row, grid.cursor_col), (1, 1));
+        assert_eq!(grid.cell(1, 0).c, 'd');
+    }
+
+    #[test]
+    fn alternate_screen_restores_primary_content() {
+        let mut grid = TerminalGrid::new(3, 8);
+        feed(&mut grid, b"main");
+        feed(&mut grid, b"\x1b[?1049halt");
+        assert_eq!(grid.cell(0, 0).c, 'a');
+
+        feed(&mut grid, b"\x1b[?1049l");
+        assert_eq!(grid.cell(0, 0).c, 'm');
+        assert_eq!(grid.cell(0, 1).c, 'a');
+        assert_eq!(grid.cell(0, 2).c, 'i');
+        assert_eq!(grid.cell(0, 3).c, 'n');
+    }
 }
