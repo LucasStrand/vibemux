@@ -65,9 +65,12 @@ pub fn input_start_column(grid: &TerminalGrid, display_row: usize) -> usize {
         return 0;
     }
     let mut i = 0usize;
+    // Skip leading whitespace.
     while i < chars.len() && chars[i] == ' ' {
         i += 1;
     }
+
+    // --- Windows prompts ---
     // PowerShell: "PS " … ">"
     let looks_like_ps =
         i + 3 <= chars.len() && chars[i] == 'P' && chars[i + 1] == 'S' && chars[i + 2].is_whitespace();
@@ -75,25 +78,55 @@ pub fn input_start_column(grid: &TerminalGrid, display_row: usize) -> usize {
     let looks_like_path_prompt = i + 2 < chars.len()
         && chars[i].is_ascii_alphanumeric()
         && chars.get(i + 1) == Some(&':');
-    // First `>` after the prefix: the prompt terminator, not a later `>` in `cmd > file`.
-    let mut gt_idx = None;
-    for (idx, &ch) in chars.iter().enumerate().skip(i) {
-        if ch == '>' {
-            gt_idx = Some(idx);
-            break;
+
+    if looks_like_ps || looks_like_path_prompt {
+        // First `>` after the prefix: the prompt terminator.
+        for (idx, &ch) in chars.iter().enumerate().skip(i) {
+            if ch == '>' {
+                let mut col = idx + 1;
+                while col < chars.len() && chars[col] == ' ' {
+                    col += 1;
+                }
+                return col.min(grid.cols.saturating_sub(1));
+            }
         }
     }
-    let Some(gt) = gt_idx else {
-        return 0;
-    };
-    if !looks_like_ps && !looks_like_path_prompt {
-        return 0;
+
+    // --- Unix-style prompts ---
+    // Common patterns: "user@host:~$ ", "$ ", "% ", "# ", ">>> "
+    // Look for common prompt terminators: "$ ", "% ", "# ", "> "
+    // Scan for the *last* prompt-like suffix before the cursor.
+    let line_str: String = chars[i..].iter().collect();
+
+    // Check for "$ " or "% " or "# " pattern (common bash/zsh/root prompts).
+    for suffix in &["$ ", "% ", "# "] {
+        if let Some(pos) = line_str.rfind(suffix) {
+            let abs = i + pos + suffix.len();
+            if abs <= grid.cursor_col + 1 {
+                return abs.min(grid.cols.saturating_sub(1));
+            }
+        }
     }
-    let mut col = gt + 1;
-    while col < chars.len() && chars[col] == ' ' {
-        col += 1;
+    // Also check terminal `$`/`%`/`#` at end without trailing space (cursor is right after).
+    for ch in &['$', '%', '#'] {
+        if let Some(pos) = line_str.rfind(*ch) {
+            let abs = i + pos + 1;
+            // Skip any spaces after the prompt char.
+            let mut col = abs;
+            while col < chars.len() && chars[col] == ' ' {
+                col += 1;
+            }
+            if col <= grid.cursor_col + 1 && col > i {
+                return col.min(grid.cols.saturating_sub(1));
+            }
+        }
     }
-    col.min(grid.cols.saturating_sub(1))
+    // Python REPL: ">>> "
+    if line_str.starts_with(">>> ") {
+        return (i + 4).min(grid.cols.saturating_sub(1));
+    }
+
+    0
 }
 
 /// Clamp column on the PTY cursor row so selection cannot enter the prompt.

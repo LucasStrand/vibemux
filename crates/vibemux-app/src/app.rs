@@ -15,11 +15,11 @@ use iced::keyboard;
 use iced::mouse;
 use iced::widget::operation;
 use iced::widget::{column, container, row, text};
-use iced::{event, Element, Fill, Length, Point, Size, Subscription, Task, Theme};
+use iced::{event, Element, Fill, Font, Length, Point, Size, Subscription, Task, Theme};
 use iced::window;
 use std::collections::HashMap;
 use uuid::Uuid;
-use vibemux_mux::{Pane, PaneId, SplitTree, WorkspaceManager, WorkspaceTab};
+use vibemux_mux::{Pane, PaneId, SplitDirection, SplitTree, WorkspaceManager, WorkspaceTab};
 use vibemux_term::Terminal;
 
 pub struct VibeMux {
@@ -46,6 +46,13 @@ pub struct VibeMux {
     /// Anchor cell for an in-progress selection (shown only after pointer moves).
     selection_pending_anchor: Option<(PaneId, (usize, usize))>,
     selection_drag_moved: bool,
+    /// Loaded config.
+    config: vibemux_config::Config,
+    /// Resolved terminal font.
+    term_font: Font,
+    term_font_size: f32,
+    /// Split divider drag state.
+    split_drag_active: Option<Uuid>,
 }
 
 // Variants are handled in `update`; some are reserved for subscriptions / shortcuts not wired yet.
@@ -72,6 +79,8 @@ pub enum Message {
     CommandPaletteConfirm,
     ToggleFindBar,
     FindBarInput(String),
+    FindBarNext,
+    FindBarPrev,
     SaveSession,
     Tick,
     NewTab,
@@ -99,33 +108,125 @@ pub enum Message {
     TerminalExtendSelectionLineStart,
     TerminalExtendSelectionLineEnd,
     WindowResized(Size),
+    /// Split divider drag events.
+    SplitDragStart(Uuid, SplitDirection),
+    SplitDragMove(Uuid, SplitDirection, Point),
+    SplitDragEnd,
 }
 
 impl VibeMux {
     pub fn new() -> (Self, Task<Message>) {
+        let config = vibemux_config::Config::load().unwrap_or_default();
+        let scrollback_limit = config.terminal.scrollback_limit;
+
+        // Try to load a custom font by family name. Iced will use MONOSPACE as
+        // fallback if the font is not found at runtime.
+        let term_font = Font::MONOSPACE;
+        let term_font_size = config.font.size;
+
         let mut manager = WorkspaceManager::new();
 
-        let pane = Pane::new();
-        let pane_id = pane.id;
-        {
-            let tab = manager.active_mut().active_tab_mut();
-            tab.split_tree = SplitTree::with_pane(pane_id);
-            if let Ok(cwd) = std::env::current_dir() {
-                let cwd_str = cwd.to_string_lossy().to_string();
-                tab.cwd = Some(cwd_str.clone());
-                tab.git_branch = git_info::detect_git_branch(&cwd_str);
+        // Try to restore previous session.
+        let restored = crate::session::SessionState::load().ok();
+
+        let mut terminals = HashMap::new();
+        let mut pty_readers = HashMap::new();
+        let mut stick = HashMap::new();
+
+        if let Some(session) = &restored {
+            // Rebuild workspaces from session state.
+            // First, remove the default workspace that WorkspaceManager::new() created.
+            // We'll build fresh ones from the session.
+            // We can't close the last workspace, so we create session ones first.
+            let mut first = true;
+            for ws_state in &session.workspaces {
+                if first {
+                    // Reuse the existing workspace.
+                    manager.active_mut().name = ws_state.name.clone();
+                    manager.active_mut().pinned = ws_state.pinned;
+                    // Clear default tab.
+                    manager.active_mut().tabs.clear();
+                    first = false;
+                } else {
+                    manager.create_workspace(&ws_state.name);
+                    manager.active_mut().pinned = ws_state.pinned;
+                    manager.active_mut().tabs.clear();
+                }
+
+                for tab_state in &ws_state.tabs {
+                    let (root_node, pane_list) =
+                        crate::session::restore_split_layout(&tab_state.split_layout);
+                    let first_pane = pane_list.first().map(|(id, _)| *id);
+                    let mut tab = WorkspaceTab::new();
+                    tab.split_tree = SplitTree {
+                        root: Some(root_node),
+                        focused_pane: first_pane,
+                    };
+                    tab.cwd = tab_state.cwd.clone();
+                    if let Some(ref cwd) = tab_state.cwd {
+                        tab.git_branch = git_info::detect_git_branch(cwd);
+                    }
+                    manager.active_mut().tabs.push(tab);
+
+                    for (pane_id, cwd) in &pane_list {
+                        if let Ok(term) = Terminal::spawn_with_scrollback(
+                            30,
+                            120,
+                            config.terminal.shell.as_deref(),
+                            scrollback_limit,
+                        ) {
+                            let reader = PtyReader::spawn(term.pty.get_reader());
+                            terminals.insert(*pane_id, term);
+                            pty_readers.insert(*pane_id, reader);
+                            stick.insert(*pane_id, true);
+                            // If there's a CWD, send a `cd` command.
+                            if let Some(cwd) = cwd {
+                                if let Some(t) = terminals.get_mut(pane_id) {
+                                    let cd_cmd = format!("cd \"{}\"\r", cwd.replace('"', "\\\""));
+                                    let _ = t.write(cd_cmd.as_bytes());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                manager.active_mut().active_tab_index =
+                    ws_state.active_tab_index.min(manager.active().tabs.len().saturating_sub(1));
+            }
+
+            if session.active_workspace_index < manager.workspaces().len() {
+                let target_id = manager.workspaces()[session.active_workspace_index].id;
+                manager.select_workspace(target_id);
             }
         }
 
-        let terminal =
-            Terminal::spawn(30, 120, None).expect("Failed to spawn terminal");
-        let pty_reader = PtyReader::spawn(terminal.pty.get_reader());
+        // If no session was restored (or it was empty), set up defaults.
+        if terminals.is_empty() {
+            let pane = Pane::new();
+            let pane_id = pane.id;
+            {
+                let tab = manager.active_mut().active_tab_mut();
+                tab.split_tree = SplitTree::with_pane(pane_id);
+                if let Ok(cwd) = std::env::current_dir() {
+                    let cwd_str = cwd.to_string_lossy().to_string();
+                    tab.cwd = Some(cwd_str.clone());
+                    tab.git_branch = git_info::detect_git_branch(&cwd_str);
+                }
+            }
 
-        let mut terminals = HashMap::new();
-        terminals.insert(pane_id, terminal);
+            let terminal = Terminal::spawn_with_scrollback(
+                30,
+                120,
+                config.terminal.shell.as_deref(),
+                scrollback_limit,
+            )
+            .expect("Failed to spawn terminal");
+            let pty_reader = PtyReader::spawn(terminal.pty.get_reader());
 
-        let mut pty_readers = HashMap::new();
-        pty_readers.insert(pane_id, pty_reader);
+            terminals.insert(pane_id, terminal);
+            pty_readers.insert(pane_id, pty_reader);
+            stick.insert(pane_id, true);
+        }
 
         let (ipc_tx, ipc_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -174,12 +275,16 @@ impl VibeMux {
             last_window_size: Some(Size::new(1200.0, 800.0)),
             last_session_save: std::time::Instant::now(),
             bytes_received: 0,
-            terminal_stick_to_bottom: HashMap::from([(pane_id, true)]),
+            terminal_stick_to_bottom: stick,
             terminal_selection: HashMap::new(),
             terminal_pointer_local: HashMap::new(),
             selection_drag_pane: None,
             selection_pending_anchor: None,
             selection_drag_moved: false,
+            config,
+            term_font,
+            term_font_size,
+            split_drag_active: None,
         };
         app.resize_terminals_from_window();
         let tabs_snap = app.snap_shell_tabs_task();
@@ -264,7 +369,12 @@ impl VibeMux {
     }
 
     fn spawn_terminal(&mut self, pane_id: PaneId) {
-        if let Ok(terminal) = Terminal::spawn(30, 120, None) {
+        if let Ok(terminal) = Terminal::spawn_with_scrollback(
+            30,
+            120,
+            self.config.terminal.shell.as_deref(),
+            self.config.terminal.scrollback_limit,
+        ) {
             let reader = PtyReader::spawn(terminal.pty.get_reader());
             self.terminals.insert(pane_id, terminal);
             self.pty_readers.insert(pane_id, reader);
@@ -273,6 +383,10 @@ impl VibeMux {
     }
 
     fn remove_terminal(&mut self, pane_id: PaneId) {
+        // Signal the reader thread to stop.
+        if let Some(reader) = self.pty_readers.get(&pane_id) {
+            reader.shutdown();
+        }
         self.terminals.remove(&pane_id);
         self.pty_readers.remove(&pane_id);
         self.terminal_stick_to_bottom.remove(&pane_id);
@@ -496,6 +610,23 @@ impl VibeMux {
             }
             Message::TerminalMouseMove(pane_id, pt) => {
                 self.terminal_pointer_local.insert(pane_id, pt);
+
+                // Forward mouse move to terminal app if it wants tracking.
+                if self.selection_drag_pane.is_none() {
+                    if let Some(terminal) = self.terminals.get_mut(&pane_id) {
+                        if terminal.grid.mouse_tracking == vibemux_term::MouseTracking::AnyEvent {
+                            let grid = &terminal.grid;
+                            let (r, c) = point_to_cell(pt.x, pt.y, grid.cols, grid.rows);
+                            terminal.send_mouse_event(vibemux_term::MouseEvent {
+                                kind: vibemux_term::MouseEventKind::Move,
+                                button: vibemux_term::MouseButton::Left,
+                                col: c as u16,
+                                row: r as u16,
+                            });
+                        }
+                    }
+                }
+
                 if self.selection_drag_pane == Some(pane_id) {
                     if let Some(terminal) = self.terminals.get(&pane_id) {
                         let grid = &terminal.grid;
@@ -520,6 +651,33 @@ impl VibeMux {
                 }
             }
             Message::TerminalMouseDown(pane_id) => {
+                // Check if the terminal app wants mouse events.
+                if let Some(terminal) = self.terminals.get_mut(&pane_id) {
+                    if terminal.grid.mouse_tracking != vibemux_term::MouseTracking::Off {
+                        let p = self
+                            .terminal_pointer_local
+                            .get(&pane_id)
+                            .copied()
+                            .unwrap_or_else(|| Point::new(5.0, 5.0));
+                        let grid = &terminal.grid;
+                        let (r, c) = point_to_cell(p.x, p.y, grid.cols, grid.rows);
+                        let consumed = terminal.send_mouse_event(vibemux_term::MouseEvent {
+                            kind: vibemux_term::MouseEventKind::Press,
+                            button: vibemux_term::MouseButton::Left,
+                            col: c as u16,
+                            row: r as u16,
+                        });
+                        if consumed {
+                            // Focus the pane but don't start selection.
+                            self.workspace_manager
+                                .active_mut()
+                                .split_tree_mut()
+                                .focused_pane = Some(pane_id);
+                            return Task::none();
+                        }
+                    }
+                }
+
                 self.workspace_manager
                     .active_mut()
                     .split_tree_mut()
@@ -548,8 +706,30 @@ impl VibeMux {
                 self.terminal_selection.insert(pane_id, None);
             }
             Message::TerminalMouseUpAnywhere => {
+                // Send release to terminal app if mouse tracking.
+                if let Some(focused) = self.focused_pane_id() {
+                    if let Some(terminal) = self.terminals.get_mut(&focused) {
+                        if terminal.grid.mouse_tracking != vibemux_term::MouseTracking::Off {
+                            let p = self
+                                .terminal_pointer_local
+                                .get(&focused)
+                                .copied()
+                                .unwrap_or_else(|| Point::new(5.0, 5.0));
+                            let grid = &terminal.grid;
+                            let (r, c) = point_to_cell(p.x, p.y, grid.cols, grid.rows);
+                            terminal.send_mouse_event(vibemux_term::MouseEvent {
+                                kind: vibemux_term::MouseEventKind::Release,
+                                button: vibemux_term::MouseButton::Left,
+                                col: c as u16,
+                                row: r as u16,
+                            });
+                        }
+                    }
+                }
+
                 let pane_opt = self.selection_drag_pane.take();
                 self.selection_pending_anchor = None;
+                self.split_drag_active = None;
                 if !self.selection_drag_moved {
                     if let Some(pid) = pane_opt {
                         self.terminal_selection.insert(pid, None);
@@ -641,6 +821,23 @@ impl VibeMux {
                                 .scroll_list_to_selection_task(false);
                         }
                         _ => return Task::none(),
+                    }
+                }
+
+                // Find bar keyboard shortcuts.
+                if self.find_bar.visible {
+                    match &key {
+                        keyboard::Key::Named(keyboard::key::Named::Escape) => {
+                            return self.update(Message::ToggleFindBar);
+                        }
+                        keyboard::Key::Named(keyboard::key::Named::Enter) => {
+                            if modifiers.shift() {
+                                return self.update(Message::FindBarPrev);
+                            } else {
+                                return self.update(Message::FindBarNext);
+                            }
+                        }
+                        _ => {}
                     }
                 }
 
@@ -855,9 +1052,7 @@ impl VibeMux {
                     }
                 }
 
-                // Backspace / Ctrl+Shift+X: delete or cut the in-app selection. The PTY
-                // cursor does not move with Shift+arrows, so a plain backspace would edit
-                // the wrong position unless we emit arrow + Delete sequences first.
+                // Backspace / Ctrl+Shift+X: delete or cut the in-app selection.
                 if !self.command_palette.visible && !self.find_bar.visible {
                     use keyboard::key::Named;
                     if let Some(focused) = self.focused_pane_id() {
@@ -919,8 +1114,15 @@ impl VibeMux {
                         );
                         self.find_bar.match_count = matches.len();
                         self.find_bar.current_match = 0;
+                        self.find_bar.matches = matches;
                     }
                 }
+            }
+            Message::FindBarNext => {
+                self.find_bar.next_match();
+            }
+            Message::FindBarPrev => {
+                self.find_bar.prev_match();
             }
             Message::SaveSession => {
                 self.save_session();
@@ -954,12 +1156,64 @@ impl VibeMux {
                     return self.update(msg);
                 }
             }
+            Message::SplitDragStart(split_id, _dir) => {
+                self.split_drag_active = Some(split_id);
+            }
+            Message::SplitDragMove(split_id, dir, point) => {
+                if self.split_drag_active == Some(split_id) {
+                    // Calculate the ratio based on pointer position relative to window.
+                    // This is approximate since we get local coords within the divider area.
+                    // We'll use the window size to compute the ratio.
+                    if let Some(size) = self.last_window_size {
+                        const SIDEBAR_W: f32 = 220.0;
+                        const MAIN_DIVIDER: f32 = 1.0;
+                        const TAB_BAR_H: f32 = 44.0;
+
+                        let ratio = match dir {
+                            SplitDirection::Vertical => {
+                                let content_w = size.width - SIDEBAR_W - MAIN_DIVIDER;
+                                // point.x is in local coords of the mouse_area (divider)
+                                // We need to use a different approach: the ratio should
+                                // be computed from the fraction of the available space.
+                                // For now, use a simple approach: shift ratio by the
+                                // delta from center.
+                                // Since we can't get absolute coords easily, just use
+                                // relative movement from the point's x position.
+                                // point.x will be negative when dragging left of the divider.
+                                let current_ratio = self.get_split_ratio(split_id).unwrap_or(0.5);
+                                let delta = point.x / content_w.max(1.0);
+                                (current_ratio + delta).clamp(0.1, 0.9)
+                            }
+                            SplitDirection::Horizontal => {
+                                let content_h = size.height - TAB_BAR_H;
+                                let current_ratio = self.get_split_ratio(split_id).unwrap_or(0.5);
+                                let delta = point.y / content_h.max(1.0);
+                                (current_ratio + delta).clamp(0.1, 0.9)
+                            }
+                        };
+                        self.set_split_ratio(split_id, ratio);
+                        self.resize_terminals_from_window();
+                    }
+                }
+            }
+            Message::SplitDragEnd => {
+                self.split_drag_active = None;
+            }
             Message::Tick => {
                 let pane_ids: Vec<PaneId> =
                     self.pty_readers.keys().copied().collect();
                 let mut snap_tasks: Vec<Task<Message>> = Vec::new();
-
                 for pane_id in pane_ids {
+                    let has_data = self
+                        .pty_readers
+                        .get(&pane_id)
+                        .map(|r| r.has_data())
+                        .unwrap_or(false);
+
+                    if !has_data {
+                        continue;
+                    }
+
                     let data =
                         if let Some(reader) = self.pty_readers.get(&pane_id) {
                             let d = reader.drain();
@@ -1068,6 +1322,8 @@ impl VibeMux {
                 focused,
                 self.bytes_received,
                 &self.terminal_selection,
+                self.term_font,
+                self.term_font_size,
             )
         } else {
             empty_pane()
@@ -1377,6 +1633,31 @@ impl VibeMux {
 
         if let Err(e) = state.save() {
             log::error!("Failed to save session: {e}");
+        }
+    }
+
+    /// Get the ratio of a split node by its UUID.
+    fn get_split_ratio(&self, split_id: Uuid) -> Option<f32> {
+        for ws in self.workspace_manager.workspaces() {
+            for tab in &ws.tabs {
+                if let Some(root) = &tab.split_tree.root {
+                    if let Some(r) = find_split_ratio(root, split_id) {
+                        return Some(r);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Set the ratio of a split node by its UUID.
+    fn set_split_ratio(&mut self, split_id: Uuid, ratio: f32) {
+        for ws in self.workspace_manager.workspaces_mut() {
+            for tab in &mut ws.tabs {
+                if let Some(root) = &mut tab.split_tree.root {
+                    set_split_ratio_recursive(root, split_id, ratio);
+                }
+            }
         }
     }
 
@@ -1709,6 +1990,50 @@ impl VibeMux {
                     req_id,
                     json!({"surfaces": surfaces}),
                 ));
+            }
+        }
+    }
+}
+
+fn find_split_ratio(node: &vibemux_mux::SplitNode, target_id: Uuid) -> Option<f32> {
+    match node {
+        vibemux_mux::SplitNode::Leaf { .. } => None,
+        vibemux_mux::SplitNode::Split {
+            id,
+            ratio,
+            first,
+            second,
+            ..
+        } => {
+            if *id == target_id {
+                Some(*ratio)
+            } else {
+                find_split_ratio(first, target_id)
+                    .or_else(|| find_split_ratio(second, target_id))
+            }
+        }
+    }
+}
+
+fn set_split_ratio_recursive(
+    node: &mut vibemux_mux::SplitNode,
+    target_id: Uuid,
+    new_ratio: f32,
+) {
+    match node {
+        vibemux_mux::SplitNode::Leaf { .. } => {}
+        vibemux_mux::SplitNode::Split {
+            id,
+            ratio,
+            first,
+            second,
+            ..
+        } => {
+            if *id == target_id {
+                *ratio = new_ratio;
+            } else {
+                set_split_ratio_recursive(first, target_id, new_ratio);
+                set_split_ratio_recursive(second, target_id, new_ratio);
             }
         }
     }

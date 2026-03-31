@@ -12,3 +12,4 @@ serde = { workspace = true }
 uuid = { workspace = true }
 vte = "0.15"
 which = "7"
+unicode-width = "0.2"

@@ -51,7 +51,6 @@ impl SessionState {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub fn load() -> anyhow::Result<Self> {
         let path = Self::session_path();
         if !path.exists() {
@@ -82,5 +81,41 @@ pub fn capture_split_layout(
             first: Box::new(capture_split_layout(first, cwd_for_pane)),
             second: Box::new(capture_split_layout(second, cwd_for_pane)),
         },
+    }
+}
+
+/// Restore a split layout, returning the root SplitNode and a list of
+/// (pane_id, cwd) pairs that need terminals spawned.
+pub fn restore_split_layout(
+    layout: &SplitLayoutState,
+) -> (SplitNode, Vec<(uuid::Uuid, Option<String>)>) {
+    match layout {
+        SplitLayoutState::Single { cwd } => {
+            let pane_id = uuid::Uuid::new_v4();
+            (
+                SplitNode::leaf(pane_id),
+                vec![(pane_id, cwd.clone())],
+            )
+        }
+        SplitLayoutState::Split {
+            direction,
+            ratio,
+            first,
+            second,
+        } => {
+            let (first_node, mut first_panes) = restore_split_layout(first);
+            let (second_node, second_panes) = restore_split_layout(second);
+            first_panes.extend(second_panes);
+            (
+                SplitNode::Split {
+                    id: uuid::Uuid::new_v4(),
+                    direction: *direction,
+                    ratio: *ratio,
+                    first: Box::new(first_node),
+                    second: Box::new(second_node),
+                },
+                first_panes,
+            )
+        }
     }
 }

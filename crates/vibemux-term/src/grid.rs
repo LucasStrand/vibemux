@@ -1,4 +1,6 @@
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
+use unicode_width::UnicodeWidthChar;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Color {
@@ -46,6 +48,8 @@ impl Default for CellAttributes {
 pub struct Cell {
     pub c: char,
     pub attrs: CellAttributes,
+    /// True for the second cell of a double-width character.
+    pub wide_continuation: bool,
 }
 
 impl Default for Cell {
@@ -53,6 +57,7 @@ impl Default for Cell {
         Self {
             c: ' ',
             attrs: CellAttributes::default(),
+            wide_continuation: false,
         }
     }
 }
@@ -64,7 +69,8 @@ pub struct TerminalGrid {
     pub cursor_row: usize,
     pub cursor_col: usize,
     pub cursor_visible: bool,
-    scrollback: Vec<Vec<Cell>>,
+    scrollback: VecDeque<Vec<Cell>>,
+    scrollback_limit: usize,
     pub scroll_offset: usize,
     current_attrs: CellAttributes,
     /// Pending notification parsed from OSC sequences
@@ -79,6 +85,28 @@ pub struct TerminalGrid {
     saved_primary_screen: Option<SavedScreen>,
     saved_cursor: Option<(usize, usize)>,
     wrap_pending: bool,
+    /// Mouse tracking modes enabled by the application.
+    pub mouse_tracking: MouseTracking,
+    /// Whether SGR (1006) extended mouse mode is active.
+    pub mouse_sgr_mode: bool,
+    /// Dirty flag: set when grid content changes, cleared by the renderer.
+    pub dirty: bool,
+    /// Scroll region: top margin (0-based, inclusive).
+    scroll_top: usize,
+    /// Scroll region: bottom margin (0-based, inclusive).
+    scroll_bottom: usize,
+}
+
+/// Which mouse events the terminal application wants reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseTracking {
+    Off,
+    /// Mode 1000: report button press/release.
+    Normal,
+    /// Mode 1002: report button press/release + drag with button held.
+    ButtonEvent,
+    /// Mode 1003: report all motion (even without button).
+    AnyEvent,
 }
 
 #[derive(Debug, Clone)]
@@ -91,7 +119,7 @@ pub struct Notification {
 #[derive(Debug, Clone)]
 struct SavedScreen {
     cells: Vec<Vec<Cell>>,
-    scrollback: Vec<Vec<Cell>>,
+    scrollback: VecDeque<Vec<Cell>>,
     cursor_row: usize,
     cursor_col: usize,
     cursor_visible: bool,
@@ -100,6 +128,10 @@ struct SavedScreen {
 
 impl TerminalGrid {
     pub fn new(rows: usize, cols: usize) -> Self {
+        Self::with_scrollback_limit(rows, cols, 10_000)
+    }
+
+    pub fn with_scrollback_limit(rows: usize, cols: usize, scrollback_limit: usize) -> Self {
         let cells = blank_cells(rows, cols);
         Self {
             cells,
@@ -108,7 +140,8 @@ impl TerminalGrid {
             cursor_row: 0,
             cursor_col: 0,
             cursor_visible: true,
-            scrollback: Vec::new(),
+            scrollback: VecDeque::new(),
+            scrollback_limit,
             scroll_offset: 0,
             current_attrs: CellAttributes::default(),
             pending_notification: None,
@@ -119,12 +152,20 @@ impl TerminalGrid {
             saved_primary_screen: None,
             saved_cursor: None,
             wrap_pending: false,
+            mouse_tracking: MouseTracking::Off,
+            mouse_sgr_mode: false,
+            dirty: true,
+            scroll_top: 0,
+            scroll_bottom: rows.saturating_sub(1),
         }
     }
 
     pub fn resize(&mut self, rows: usize, cols: usize) {
         self.rows = rows;
         self.cols = cols;
+        // Reset scroll region to full screen on resize.
+        self.scroll_top = 0;
+        self.scroll_bottom = rows.saturating_sub(1);
         resize_screen(
             &mut self.cells,
             rows,
@@ -142,6 +183,7 @@ impl TerminalGrid {
             );
         }
         self.wrap_pending = false;
+        self.dirty = true;
     }
 
     pub fn cell(&self, row: usize, col: usize) -> &Cell {
@@ -176,14 +218,46 @@ impl TerminalGrid {
         self.scrollback.len() + self.cursor_row
     }
 
-    fn scroll_up(&mut self) {
-        if !self.cells.is_empty() {
-            let line = self.cells.remove(0);
-            self.scrollback.push(line);
-            self.cells.push(blank_row(self.cols));
-            if self.scrollback.len() > 10_000 {
-                self.scrollback.remove(0);
+    /// Scroll the content inside the scroll region up by one line.
+    /// The top line of the region is removed and a blank line is inserted at the bottom.
+    /// If the scroll region covers the whole screen and cursor is at row 0,
+    /// the removed line goes into scrollback.
+    fn scroll_region_up(&mut self) {
+        let top = self.scroll_top;
+        let bot = self.scroll_bottom.min(self.rows.saturating_sub(1));
+        if top > bot || bot >= self.rows {
+            return;
+        }
+        let line = self.cells.remove(top);
+        // Only push to scrollback if this is a full-screen scroll (top == 0).
+        if top == 0 && !self.using_alt_screen {
+            self.scrollback.push_back(line);
+            while self.scrollback.len() > self.scrollback_limit {
+                self.scrollback.pop_front();
             }
+        }
+        // Insert blank line at the bottom of the scroll region.
+        self.cells.insert(bot, blank_row(self.cols));
+        // Ensure we still have exactly `self.rows` rows (should already be the case).
+        self.cells.truncate(self.rows);
+        while self.cells.len() < self.rows {
+            self.cells.push(blank_row(self.cols));
+        }
+    }
+
+    /// Scroll the content inside the scroll region down by one line.
+    /// A blank line is inserted at the top of the region and the bottom line is removed.
+    fn scroll_region_down(&mut self) {
+        let top = self.scroll_top;
+        let bot = self.scroll_bottom.min(self.rows.saturating_sub(1));
+        if top > bot || bot >= self.rows {
+            return;
+        }
+        self.cells.remove(bot);
+        self.cells.insert(top, blank_row(self.cols));
+        self.cells.truncate(self.rows);
+        while self.cells.len() < self.rows {
+            self.cells.push(blank_row(self.cols));
         }
     }
 
@@ -191,26 +265,64 @@ impl TerminalGrid {
         if self.wrap_pending {
             self.wrap_to_next_line();
         }
+        let w = c.width().unwrap_or(0);
+        if w == 0 {
+            return;
+        }
         if self.cursor_row < self.rows && self.cursor_col < self.cols {
+            if w == 2 && self.cursor_col + 1 >= self.cols {
+                self.cells[self.cursor_row][self.cursor_col] = Cell::default();
+                self.wrap_to_next_line();
+            }
+
             self.cells[self.cursor_row][self.cursor_col] = Cell {
                 c,
                 attrs: self.current_attrs,
+                wide_continuation: false,
             };
+
+            if w == 2 && self.cursor_col + 1 < self.cols {
+                self.cells[self.cursor_row][self.cursor_col + 1] = Cell {
+                    c: ' ',
+                    attrs: self.current_attrs,
+                    wide_continuation: true,
+                };
+                self.cursor_col += 1;
+            }
+
             if self.cursor_col + 1 >= self.cols {
                 self.wrap_pending = true;
             } else {
                 self.cursor_col += 1;
             }
         }
+        self.dirty = true;
     }
 
+    /// Linefeed / newline: move cursor down. If at the bottom of the scroll region,
+    /// scroll the region up instead.
     fn newline(&mut self) {
         self.wrap_pending = false;
-        self.cursor_row += 1;
-        if self.cursor_row >= self.rows {
-            self.scroll_up();
-            self.cursor_row = self.rows - 1;
+        let bot = self.scroll_bottom.min(self.rows.saturating_sub(1));
+        if self.cursor_row == bot {
+            // At the bottom margin — scroll the region up.
+            self.scroll_region_up();
+        } else if self.cursor_row < self.rows.saturating_sub(1) {
+            self.cursor_row += 1;
         }
+        self.dirty = true;
+    }
+
+    /// Reverse index (ESC M): move cursor up. If at the top of the scroll region,
+    /// scroll the region down instead.
+    fn reverse_index(&mut self) {
+        self.wrap_pending = false;
+        if self.cursor_row == self.scroll_top {
+            self.scroll_region_down();
+        } else if self.cursor_row > 0 {
+            self.cursor_row -= 1;
+        }
+        self.dirty = true;
     }
 
     fn carriage_return(&mut self) {
@@ -218,8 +330,6 @@ impl TerminalGrid {
         self.wrap_pending = false;
     }
 
-    /// Backspace is cursor motion only; erasing should be performed by explicit
-    /// delete/erase control sequences emitted by the host.
     fn backspace(&mut self) {
         self.wrap_pending = false;
         if self.cursor_col > 0 {
@@ -230,11 +340,31 @@ impl TerminalGrid {
     fn wrap_to_next_line(&mut self) {
         self.wrap_pending = false;
         self.cursor_col = 0;
-        self.cursor_row += 1;
-        if self.cursor_row >= self.rows {
-            self.scroll_up();
-            self.cursor_row = self.rows.saturating_sub(1);
+        let bot = self.scroll_bottom.min(self.rows.saturating_sub(1));
+        if self.cursor_row == bot {
+            self.scroll_region_up();
+        } else if self.cursor_row < self.rows.saturating_sub(1) {
+            self.cursor_row += 1;
         }
+    }
+
+    /// Set scroll region (DECSTBM). Parameters are 1-based; 0 means default.
+    fn set_scroll_region(&mut self, top_1: u16, bottom_1: u16) {
+        let top = if top_1 == 0 { 0 } else { (top_1 - 1) as usize };
+        let bottom = if bottom_1 == 0 {
+            self.rows.saturating_sub(1)
+        } else {
+            ((bottom_1 - 1) as usize).min(self.rows.saturating_sub(1))
+        };
+        if top < bottom && bottom < self.rows {
+            self.scroll_top = top;
+            self.scroll_bottom = bottom;
+        }
+        // DECSTBM also homes the cursor.
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+        self.wrap_pending = false;
+        self.dirty = true;
     }
 
     fn erase_in_display(&mut self, mode: u16) {
@@ -273,6 +403,7 @@ impl TerminalGrid {
             }
             _ => {}
         }
+        self.dirty = true;
     }
 
     fn erase_in_line(&mut self, mode: u16) {
@@ -299,9 +430,9 @@ impl TerminalGrid {
             }
             _ => {}
         }
+        self.dirty = true;
     }
 
-    /// ECMA-48 ECH — erase `n` cells with blanks without moving the cursor (CSI n X).
     fn erase_chars(&mut self, n: usize) {
         if self.rows == 0 || n == 0 {
             return;
@@ -315,6 +446,66 @@ impl TerminalGrid {
                 self.cells[r][c] = Cell::default();
             }
         }
+        self.dirty = true;
+    }
+
+    /// Insert `n` blank lines at the cursor row, within the scroll region.
+    fn insert_lines(&mut self, n: usize) {
+        self.wrap_pending = false;
+        let bot = self.scroll_bottom.min(self.rows.saturating_sub(1));
+        if self.cursor_row > bot {
+            return;
+        }
+        for _ in 0..n {
+            if self.cursor_row <= bot && bot < self.cells.len() {
+                self.cells.remove(bot);
+                self.cells.insert(self.cursor_row, blank_row(self.cols));
+            }
+        }
+        // Ensure grid stays the right size.
+        self.cells.truncate(self.rows);
+        while self.cells.len() < self.rows {
+            self.cells.push(blank_row(self.cols));
+        }
+        self.dirty = true;
+    }
+
+    /// Delete `n` lines at the cursor row, within the scroll region.
+    fn delete_lines(&mut self, n: usize) {
+        self.wrap_pending = false;
+        let bot = self.scroll_bottom.min(self.rows.saturating_sub(1));
+        if self.cursor_row > bot {
+            return;
+        }
+        for _ in 0..n {
+            if self.cursor_row < self.cells.len() && self.cursor_row <= bot {
+                self.cells.remove(self.cursor_row);
+                // Insert blank at the bottom of the scroll region.
+                let insert_at = bot.min(self.cells.len());
+                self.cells.insert(insert_at, blank_row(self.cols));
+            }
+        }
+        self.cells.truncate(self.rows);
+        while self.cells.len() < self.rows {
+            self.cells.push(blank_row(self.cols));
+        }
+        self.dirty = true;
+    }
+
+    /// CSI S: Scroll up `n` lines within the scroll region.
+    fn scroll_up_n(&mut self, n: usize) {
+        for _ in 0..n {
+            self.scroll_region_up();
+        }
+        self.dirty = true;
+    }
+
+    /// CSI T: Scroll down `n` lines within the scroll region.
+    fn scroll_down_n(&mut self, n: usize) {
+        for _ in 0..n {
+            self.scroll_region_down();
+        }
+        self.dirty = true;
     }
 
     fn set_sgr(&mut self, params: &[u16]) {
@@ -323,6 +514,7 @@ impl TerminalGrid {
             match params[i] {
                 0 => self.current_attrs = CellAttributes::default(),
                 1 => self.current_attrs.bold = true,
+                2 => self.current_attrs.bold = false, // dim/faint — treat as not-bold
                 3 => self.current_attrs.italic = true,
                 4 => self.current_attrs.underline = true,
                 7 => self.current_attrs.inverse = true,
@@ -425,6 +617,9 @@ impl TerminalGrid {
         self.cursor_visible = true;
         self.wrap_pending = false;
         self.using_alt_screen = true;
+        self.scroll_top = 0;
+        self.scroll_bottom = self.rows.saturating_sub(1);
+        self.dirty = true;
     }
 
     fn exit_alternate_screen(&mut self) {
@@ -439,6 +634,9 @@ impl TerminalGrid {
         self.cursor_visible = saved.cursor_visible;
         self.wrap_pending = saved.wrap_pending;
         self.using_alt_screen = false;
+        self.scroll_top = 0;
+        self.scroll_bottom = self.rows.saturating_sub(1);
+        self.dirty = true;
     }
 }
 
@@ -537,11 +735,10 @@ impl vte::Perform for VteHandler<'_> {
             b'\n' => self.grid.newline(),
             b'\r' => self.grid.carriage_return(),
             b'\x08' => self.grid.backspace(),
-            // Windows / xterm often send DEL for backspace in the echo stream too.
             b'\x7f' => self.grid.backspace(),
             b'\t' => {
                 let next_tab = (self.grid.cursor_col + 8) & !7;
-                self.grid.cursor_col = next_tab.min(self.grid.cols - 1);
+                self.grid.cursor_col = next_tab.min(self.grid.cols.saturating_sub(1));
             }
             b'\x07' => {} // bell
             _ => {}
@@ -618,24 +815,20 @@ impl vte::Perform for VteHandler<'_> {
 
         match action {
             'c' if is_gt => {
-                // Secondary Device Attributes - respond as VT100
                 self.grid.queue_response(b"\x1b[>0;0;0c".to_vec());
                 return;
             }
             'c' => {
-                // Primary Device Attributes - respond as VT102
                 self.grid.queue_response(b"\x1b[?6c".to_vec());
                 return;
             }
             'n' => {
                 match p0 {
                     5 => {
-                        // Device Status Report - respond OK
                         self.grid.queue_response(b"\x1b[0n".to_vec());
                         return;
                     }
                     6 => {
-                        // Cursor Position Report
                         let response = format!(
                             "\x1b[{};{}R",
                             self.grid.cursor_row + 1,
@@ -651,23 +844,44 @@ impl vte::Perform for VteHandler<'_> {
                 self.grid.wrap_pending = false;
                 let n = p0.max(1) as usize;
                 self.grid.cursor_row = self.grid.cursor_row.saturating_sub(n);
+                self.grid.dirty = true;
             }
             'B' => {
                 self.grid.wrap_pending = false;
                 let n = p0.max(1) as usize;
                 self.grid.cursor_row =
                     (self.grid.cursor_row + n).min(self.grid.rows.saturating_sub(1));
+                self.grid.dirty = true;
             }
             'C' => {
                 self.grid.wrap_pending = false;
                 let n = p0.max(1) as usize;
                 self.grid.cursor_col =
                     (self.grid.cursor_col + n).min(self.grid.cols.saturating_sub(1));
+                self.grid.dirty = true;
             }
             'D' => {
                 self.grid.wrap_pending = false;
                 let n = p0.max(1) as usize;
                 self.grid.cursor_col = self.grid.cursor_col.saturating_sub(n);
+                self.grid.dirty = true;
+            }
+            'E' => {
+                // Cursor Next Line: move down N lines, to column 0.
+                self.grid.wrap_pending = false;
+                let n = p0.max(1) as usize;
+                self.grid.cursor_row =
+                    (self.grid.cursor_row + n).min(self.grid.rows.saturating_sub(1));
+                self.grid.cursor_col = 0;
+                self.grid.dirty = true;
+            }
+            'F' => {
+                // Cursor Previous Line: move up N lines, to column 0.
+                self.grid.wrap_pending = false;
+                let n = p0.max(1) as usize;
+                self.grid.cursor_row = self.grid.cursor_row.saturating_sub(n);
+                self.grid.cursor_col = 0;
+                self.grid.dirty = true;
             }
             'H' | 'f' => {
                 self.grid.wrap_pending = false;
@@ -675,13 +889,35 @@ impl vte::Perform for VteHandler<'_> {
                 let col = (p1.max(1) - 1) as usize;
                 self.grid.cursor_row = row.min(self.grid.rows.saturating_sub(1));
                 self.grid.cursor_col = col.min(self.grid.cols.saturating_sub(1));
+                self.grid.dirty = true;
             }
             'J' => self.grid.erase_in_display(p0),
             'K' => self.grid.erase_in_line(p0),
-            // Erase Character (ECH): used by ConPTY/readline-style redraws.
             'X' if intermediates.is_empty() => {
                 let n = p0.max(1) as usize;
                 self.grid.erase_chars(n);
+            }
+            'L' => {
+                let n = p0.max(1) as usize;
+                self.grid.insert_lines(n);
+            }
+            'M' => {
+                let n = p0.max(1) as usize;
+                self.grid.delete_lines(n);
+            }
+            'S' if !is_private => {
+                // Scroll Up: scroll content up N lines within scroll region.
+                let n = p0.max(1) as usize;
+                self.grid.scroll_up_n(n);
+            }
+            'T' if !is_private => {
+                // Scroll Down: scroll content down N lines within scroll region.
+                let n = p0.max(1) as usize;
+                self.grid.scroll_down_n(n);
+            }
+            'r' if !is_private => {
+                // DECSTBM: Set Top and Bottom Margins (scroll region).
+                self.grid.set_scroll_region(p0, p1);
             }
             'm' => {
                 if params_vec.is_empty() {
@@ -694,13 +930,16 @@ impl vte::Perform for VteHandler<'_> {
                 if is_private {
                     for &p in &params_vec {
                         match p {
-                            1 => {} // Application Cursor Keys - accept silently
-                            7 => {} // Auto-wrap mode
-                            12 => {} // Cursor blink
+                            1 => {}
+                            7 => {}
+                            12 => {}
                             25 => self.grid.cursor_visible = true,
-                            1000 | 1002 | 1003 | 1006 => {} // Mouse tracking
+                            1000 => self.grid.mouse_tracking = MouseTracking::Normal,
+                            1002 => self.grid.mouse_tracking = MouseTracking::ButtonEvent,
+                            1003 => self.grid.mouse_tracking = MouseTracking::AnyEvent,
+                            1006 => self.grid.mouse_sgr_mode = true,
                             1049 => self.grid.enter_alternate_screen(),
-                            2004 => {} // Bracketed paste
+                            2004 => {}
                             _ => {}
                         }
                     }
@@ -714,7 +953,8 @@ impl vte::Perform for VteHandler<'_> {
                             7 => {}
                             12 => {}
                             25 => self.grid.cursor_visible = false,
-                            1000 | 1002 | 1003 | 1006 => {}
+                            1000 | 1002 | 1003 => self.grid.mouse_tracking = MouseTracking::Off,
+                            1006 => self.grid.mouse_sgr_mode = false,
                             1049 => self.grid.exit_alternate_screen(),
                             2004 => {}
                             _ => {}
@@ -726,38 +966,16 @@ impl vte::Perform for VteHandler<'_> {
                 self.grid.wrap_pending = false;
                 let col = (p0.max(1) - 1) as usize;
                 self.grid.cursor_col = col.min(self.grid.cols.saturating_sub(1));
+                self.grid.dirty = true;
             }
             'd' => {
                 self.grid.wrap_pending = false;
                 let row = (p0.max(1) - 1) as usize;
                 self.grid.cursor_row = row.min(self.grid.rows.saturating_sub(1));
+                self.grid.dirty = true;
             }
             's' => self.grid.save_cursor(),
             'u' => self.grid.restore_cursor(),
-            'L' => {
-                self.grid.wrap_pending = false;
-                let n = p0.max(1) as usize;
-                for _ in 0..n {
-                    if self.grid.cursor_row < self.grid.rows {
-                        self.grid
-                            .cells
-                            .insert(self.grid.cursor_row, blank_row(self.grid.cols));
-                        if self.grid.cells.len() > self.grid.rows {
-                            self.grid.cells.pop();
-                        }
-                    }
-                }
-            }
-            'M' => {
-                self.grid.wrap_pending = false;
-                let n = p0.max(1) as usize;
-                for _ in 0..n {
-                    if self.grid.cursor_row < self.grid.cells.len() {
-                        self.grid.cells.remove(self.grid.cursor_row);
-                        self.grid.cells.push(blank_row(self.grid.cols));
-                    }
-                }
-            }
             'P' => {
                 self.grid.wrap_pending = false;
                 let n = p0.max(1) as usize;
@@ -771,6 +989,7 @@ impl vte::Perform for VteHandler<'_> {
                         }
                     }
                 }
+                self.grid.dirty = true;
             }
             '@' => {
                 self.grid.wrap_pending = false;
@@ -785,16 +1004,40 @@ impl vte::Perform for VteHandler<'_> {
                         self.grid.cells[row].insert(col, Cell::default());
                     }
                 }
+                self.grid.dirty = true;
             }
             _ => {}
         }
     }
 
-    fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, byte: u8) {
+    fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
         match byte {
             b'7' => self.grid.save_cursor(),
             b'8' => self.grid.restore_cursor(),
-            _ => {}
+            // ESC M: Reverse Index — move cursor up, scroll region down if at top.
+            b'M' => self.grid.reverse_index(),
+            // ESC D: Index — move cursor down, scroll region up if at bottom.
+            b'D' => self.grid.newline(),
+            // ESC E: Next Line — CR + LF.
+            b'E' => {
+                self.grid.carriage_return();
+                self.grid.newline();
+            }
+            // ESC c: Full Reset (RIS).
+            b'c' => {
+                let rows = self.grid.rows;
+                let cols = self.grid.cols;
+                let limit = self.grid.scrollback_limit;
+                *self.grid = TerminalGrid::with_scrollback_limit(rows, cols, limit);
+            }
+            // ESC ( 0 / ESC ( B: character set selection — silently ignore.
+            b'(' => {}
+            _ => {
+                // ESC ( 0, ESC ( B etc. come through intermediates.
+                if intermediates == b"(" {
+                    // Silently accept character set designations.
+                }
+            }
         }
     }
 }
@@ -835,5 +1078,86 @@ mod tests {
         assert_eq!(grid.cell(0, 1).c, 'a');
         assert_eq!(grid.cell(0, 2).c, 'i');
         assert_eq!(grid.cell(0, 3).c, 'n');
+    }
+
+    #[test]
+    fn wide_char_occupies_two_cells() {
+        let mut grid = TerminalGrid::new(2, 10);
+        let mut parser = vte::Parser::new();
+        let mut handler = VteHandler::new(&mut grid);
+        parser.advance(&mut handler, "世".as_bytes());
+        assert_eq!(grid.cell(0, 0).c, '世');
+        assert!(!grid.cell(0, 0).wide_continuation);
+        assert!(grid.cell(0, 1).wide_continuation);
+        assert_eq!(grid.cursor_col, 2);
+    }
+
+    #[test]
+    fn scroll_region_keeps_header_footer() {
+        // Simulate a TUI: set scroll region to middle rows (2-4 of a 6-row terminal).
+        let mut grid = TerminalGrid::new(6, 10);
+        let mut parser = vte::Parser::new();
+
+        // Write header on row 0.
+        {
+            let mut h = VteHandler::new(&mut grid);
+            parser.advance(&mut h, b"\x1b[1;1H"); // Move to row 1, col 1
+            parser.advance(&mut h, b"HEADER");
+        }
+        // Write footer on row 5 (last row).
+        {
+            let mut h = VteHandler::new(&mut grid);
+            parser.advance(&mut h, b"\x1b[6;1H"); // Move to row 6
+            parser.advance(&mut h, b"FOOTER");
+        }
+        // Set scroll region to rows 2-5 (1-based).
+        {
+            let mut h = VteHandler::new(&mut grid);
+            parser.advance(&mut h, b"\x1b[2;5r");
+        }
+        // Move to bottom of scroll region and print lines to trigger scrolling.
+        {
+            let mut h = VteHandler::new(&mut grid);
+            parser.advance(&mut h, b"\x1b[5;1H"); // row 5 (bottom of region)
+            parser.advance(&mut h, b"line1\n");
+            parser.advance(&mut h, b"line2\n");
+            parser.advance(&mut h, b"line3");
+        }
+
+        // Header (row 0) and footer (row 5) should be unchanged.
+        let header: String = grid.cells[0].iter().take(6).map(|c| c.c).collect();
+        let footer: String = grid.cells[5].iter().take(6).map(|c| c.c).collect();
+        assert_eq!(header, "HEADER");
+        assert_eq!(footer, "FOOTER");
+    }
+
+    #[test]
+    fn reverse_index_scrolls_region_down() {
+        let mut grid = TerminalGrid::new(5, 10);
+        let mut parser = vte::Parser::new();
+
+        // Set scroll region to rows 2-4.
+        {
+            let mut h = VteHandler::new(&mut grid);
+            parser.advance(&mut h, b"\x1b[2;4r");
+        }
+        // Move cursor to top of scroll region (row 2, 1-based = row 1, 0-based).
+        {
+            let mut h = VteHandler::new(&mut grid);
+            parser.advance(&mut h, b"\x1b[2;1H");
+            parser.advance(&mut h, b"TOP");
+        }
+        // Reverse index at the top of scroll region should push content down.
+        {
+            let mut h = VteHandler::new(&mut grid);
+            parser.advance(&mut h, b"\x1b[2;1H");
+            parser.advance(&mut h, b"\x1bM"); // ESC M = reverse index
+        }
+        // Row 1 (0-based) should now be blank (new line inserted).
+        let row1: String = grid.cells[1].iter().take(3).map(|c| c.c).collect();
+        assert_eq!(row1, "   ");
+        // "TOP" should have moved down to row 2.
+        let row2: String = grid.cells[2].iter().take(3).map(|c| c.c).collect();
+        assert_eq!(row2, "TOP");
     }
 }

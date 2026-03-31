@@ -1,6 +1,6 @@
 use crate::app::Message;
 use crate::theme;
-use iced::widget::{container, row, text, text_input};
+use iced::widget::{button, container, row, text, text_input};
 use iced::{Border, Element, Fill, Length, Padding, Theme};
 
 pub struct FindBar {
@@ -8,6 +8,7 @@ pub struct FindBar {
     pub query: String,
     pub match_count: usize,
     pub current_match: usize,
+    pub matches: Vec<(usize, usize)>,
 }
 
 impl FindBar {
@@ -17,6 +18,7 @@ impl FindBar {
             query: String::new(),
             match_count: 0,
             current_match: 0,
+            matches: Vec::new(),
         }
     }
 
@@ -26,6 +28,7 @@ impl FindBar {
             self.query.clear();
             self.match_count = 0;
             self.current_match = 0;
+            self.matches.clear();
         }
     }
 
@@ -33,9 +36,31 @@ impl FindBar {
         self.query = query;
     }
 
+    pub fn next_match(&mut self) {
+        if self.match_count > 0 {
+            self.current_match = (self.current_match + 1) % self.match_count;
+        }
+    }
+
+    pub fn prev_match(&mut self) {
+        if self.match_count > 0 {
+            self.current_match = if self.current_match == 0 {
+                self.match_count - 1
+            } else {
+                self.current_match - 1
+            };
+        }
+    }
+
+    /// Returns the (row, col) of the current match if any.
+    pub fn current_match_pos(&self) -> Option<(usize, usize)> {
+        self.matches.get(self.current_match).copied()
+    }
+
     pub fn view(&self) -> Element<'_, Message> {
         let input = text_input("Find in terminal...", &self.query)
             .on_input(Message::FindBarInput)
+            .on_submit(Message::FindBarNext)
             .size(13)
             .padding(Padding::from([6.0, 10.0]))
             .width(Length::Fixed(300.0));
@@ -50,7 +75,35 @@ impl FindBar {
             text("").size(12)
         };
 
-        let bar = row![input, count_text]
+        let prev_btn = button(text("\u{2191}").size(12))
+            .on_press(Message::FindBarPrev)
+            .padding(Padding::from([4.0, 8.0]))
+            .style(|_t: &Theme, _s| button::Style {
+                background: Some(theme::BG_SURFACE.into()),
+                text_color: theme::FG_PRIMARY,
+                border: Border {
+                    color: theme::BORDER,
+                    width: 1.0,
+                    radius: 3.0.into(),
+                },
+                ..Default::default()
+            });
+
+        let next_btn = button(text("\u{2193}").size(12))
+            .on_press(Message::FindBarNext)
+            .padding(Padding::from([4.0, 8.0]))
+            .style(|_t: &Theme, _s| button::Style {
+                background: Some(theme::BG_SURFACE.into()),
+                text_color: theme::FG_PRIMARY,
+                border: Border {
+                    color: theme::BORDER,
+                    width: 1.0,
+                    radius: 3.0.into(),
+                },
+                ..Default::default()
+            });
+
+        let bar = row![input, prev_btn, next_btn, count_text]
             .spacing(8)
             .align_y(iced::Alignment::Center)
             .padding(Padding::from([6.0, 12.0]));

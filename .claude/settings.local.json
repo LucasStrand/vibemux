@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wc -l /c/github/vibemux/crates/vibemux-app/src/*.rs)",
+      "Bash(grep -v \"//\")",
+      "Bash(cargo build:*)",
+      "Bash(cargo test:*)"
+    ]
+  }
+}
