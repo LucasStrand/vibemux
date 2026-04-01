@@ -7,7 +7,12 @@
       "Bash(cargo test:*)",
       "Bash(grep:*)",
       "Bash(find /c/github/vibemux/crates -type f \\\\\\(-name *.rs -o -name *.wgsl -o -name *.glsl \\\\\\))",
-      "Bash(cargo check:*)"
+      "Bash(cargo check:*)",
+      "Bash(/tmp/missing_sequences.txt:*)",
+      "Read(//tmp/**)",
+      "Bash(find ~/.cargo/registry/src -path */iced-0.14* -type d)",
+      "Bash(find /c/Users/lucstr01/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ -path *iced_runtime* -name *.rs -path *window*)",
+      "Bash(find /c/Users/lucstr01/.cargo/registry/src/ -path *iced* -name task.rs)"
     ]
   }
 }

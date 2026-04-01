@@ -26,9 +26,11 @@ pub struct CellAttributes {
     pub fg: Color,
     pub bg: Color,
     pub bold: bool,
+    pub dim: bool,
     pub italic: bool,
     pub underline: bool,
     pub inverse: bool,
+    pub strikethrough: bool,
 }
 
 impl Default for CellAttributes {
@@ -37,9 +39,11 @@ impl Default for CellAttributes {
             fg: Color::DEFAULT_FG,
             bg: Color::DEFAULT_BG,
             bold: false,
+            dim: false,
             italic: false,
             underline: false,
             inverse: false,
+            strikethrough: false,
         }
     }
 }
@@ -124,6 +128,7 @@ struct SavedScreen {
     cursor_col: usize,
     cursor_visible: bool,
     wrap_pending: bool,
+    current_attrs: CellAttributes,
 }
 
 impl TerminalGrid {
@@ -394,12 +399,20 @@ impl TerminalGrid {
                     self.cells[r][col] = Cell::default();
                 }
             }
-            2 | 3 => {
+            2 => {
                 for row in 0..self.rows {
                     for col in 0..self.cols {
                         self.cells[row][col] = Cell::default();
                     }
                 }
+            }
+            3 => {
+                for row in 0..self.rows {
+                    for col in 0..self.cols {
+                        self.cells[row][col] = Cell::default();
+                    }
+                }
+                self.scrollback.clear();
             }
             _ => {}
         }
@@ -514,14 +527,19 @@ impl TerminalGrid {
             match params[i] {
                 0 => self.current_attrs = CellAttributes::default(),
                 1 => self.current_attrs.bold = true,
-                2 => self.current_attrs.bold = false, // dim/faint — treat as not-bold
+                2 => self.current_attrs.dim = true,
                 3 => self.current_attrs.italic = true,
                 4 => self.current_attrs.underline = true,
                 7 => self.current_attrs.inverse = true,
-                22 => self.current_attrs.bold = false,
+                9 => self.current_attrs.strikethrough = true,
+                22 => {
+                    self.current_attrs.bold = false;
+                    self.current_attrs.dim = false;
+                }
                 23 => self.current_attrs.italic = false,
                 24 => self.current_attrs.underline = false,
                 27 => self.current_attrs.inverse = false,
+                29 => self.current_attrs.strikethrough = false,
                 30..=37 => {
                     self.current_attrs.fg = ansi_color(params[i] - 30);
                 }
@@ -608,6 +626,7 @@ impl TerminalGrid {
             cursor_col: self.cursor_col,
             cursor_visible: self.cursor_visible,
             wrap_pending: self.wrap_pending,
+            current_attrs: self.current_attrs,
         });
 
         self.cells = blank_cells(self.rows, self.cols);
@@ -633,6 +652,7 @@ impl TerminalGrid {
         self.cursor_col = saved.cursor_col.min(self.cols.saturating_sub(1));
         self.cursor_visible = saved.cursor_visible;
         self.wrap_pending = saved.wrap_pending;
+        self.current_attrs = saved.current_attrs;
         self.using_alt_screen = false;
         self.scroll_top = 0;
         self.scroll_bottom = self.rows.saturating_sub(1);

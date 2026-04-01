@@ -57,8 +57,10 @@ struct SpanRun {
     fg: Color,
     bg: Option<Color>,
     bold: bool,
+    dim: bool,
     italic: bool,
     underline: bool,
+    strikethrough: bool,
 }
 
 fn line_element<'a>(
@@ -92,7 +94,8 @@ fn line_element<'a>(
         let is_cursor = is_cursor_row && c == v_col && grid.cursor_visible;
         let raw_ch = if is_cursor { '\u{2588}' } else { row_cells[c].c };
         // Replace box-drawing chars with spaces – they'll be drawn on the canvas overlay.
-        let ch = if box_drawing::is_box_drawing(raw_ch) { ' ' } else { raw_ch };
+        // Keep the cursor block char (is_cursor) so it renders via the text span.
+        let ch = if !is_cursor && box_drawing::is_box_drawing(raw_ch) { ' ' } else { raw_ch };
 
         let (fg, cell_bg) = resolve_colors(&row_cells[c].attrs);
         let bg = if selected {
@@ -104,13 +107,16 @@ fn line_element<'a>(
         };
 
         let bold = row_cells[c].attrs.bold;
+        let dim = row_cells[c].attrs.dim;
         let italic = row_cells[c].attrs.italic;
         let underline = row_cells[c].attrs.underline;
+        let strikethrough = row_cells[c].attrs.strikethrough;
 
         // Try to extend the current run.
         let can_extend = if let Some(last) = runs.last() {
             last.fg == fg && last.bg == bg && last.bold == bold
-                && last.italic == italic && last.underline == underline
+                && last.dim == dim && last.italic == italic
+                && last.underline == underline && last.strikethrough == strikethrough
         } else {
             false
         };
@@ -123,8 +129,10 @@ fn line_element<'a>(
                 fg,
                 bg,
                 bold,
+                dim,
                 italic,
                 underline,
+                strikethrough,
             });
         }
     }
@@ -132,10 +140,16 @@ fn line_element<'a>(
     let spans: Vec<Span<'a, (), Font>> = runs
         .into_iter()
         .map(|run| {
+            // Apply dim by reducing the foreground color intensity.
+            let fg = if run.dim {
+                Color::from_rgba(run.fg.r, run.fg.g, run.fg.b, run.fg.a * 0.5)
+            } else {
+                run.fg
+            };
             let mut s = span(run.text)
                 .size(font_size)
                 .font(font)
-                .color(run.fg);
+                .color(fg);
             if let Some(bg) = run.bg {
                 s = s.background(bg);
             }
@@ -160,6 +174,9 @@ fn line_element<'a>(
             }
             if run.underline {
                 s = s.underline(true);
+            }
+            if run.strikethrough {
+                s = s.strikethrough(true);
             }
             s
         })
@@ -201,12 +218,13 @@ pub fn view<'a>(
             }
             let ch = row_cells[c].c;
             if box_drawing::is_box_drawing(ch) {
-                let (fg, _bg) = resolve_colors(&row_cells[c].attrs);
+                let (fg, bg) = resolve_colors(&row_cells[c].attrs);
                 box_cells.push(BoxDrawCell {
                     row: row_idx,
                     col: c,
                     ch,
-                    color: fg,
+                    fg,
+                    bg,
                 });
             }
         }

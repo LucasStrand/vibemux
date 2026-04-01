@@ -133,6 +133,11 @@ impl VibeMux {
         let mut pty_readers = HashMap::new();
         let mut stick = HashMap::new();
 
+        // Pre-calculate terminal dimensions from the known initial window size
+        // so that PTYs start with correct dimensions from the very first spawn.
+        let initial_window = Size::new(1200.0, 800.0);
+        let (init_rows, init_cols) = Self::default_term_size(initial_window);
+
         if let Some(session) = &restored {
             // Rebuild workspaces from session state.
             // First, remove the default workspace that WorkspaceManager::new() created.
@@ -170,8 +175,8 @@ impl VibeMux {
 
                     for (pane_id, cwd) in &pane_list {
                         if let Ok(term) = Terminal::spawn_with_scrollback(
-                            30,
-                            120,
+                            init_rows,
+                            init_cols,
                             config.terminal.shell.as_deref(),
                             scrollback_limit,
                         ) {
@@ -215,8 +220,8 @@ impl VibeMux {
             }
 
             let terminal = Terminal::spawn_with_scrollback(
-                30,
-                120,
+                init_rows,
+                init_cols,
                 config.terminal.shell.as_deref(),
                 scrollback_limit,
             )
@@ -262,7 +267,7 @@ impl VibeMux {
             });
         });
 
-        let mut app = Self {
+        let app = Self {
             workspace_manager: manager,
             terminals,
             pty_readers,
@@ -272,7 +277,7 @@ impl VibeMux {
             ipc_rx,
             next_workspace_num: 2,
             show_notification_panel: false,
-            last_window_size: Some(Size::new(1200.0, 800.0)),
+            last_window_size: None,
             last_session_save: std::time::Instant::now(),
             bytes_received: 0,
             terminal_stick_to_bottom: stick,
@@ -286,9 +291,13 @@ impl VibeMux {
             term_font_size,
             split_drag_active: None,
         };
-        app.resize_terminals_from_window();
         let tabs_snap = app.snap_shell_tabs_task();
-        (app, tabs_snap)
+        // Query the actual window size so we can resize terminals to match.
+        // resize_events() only fires on *changes*, so we need this initial query.
+        let get_size = window::latest()
+            .and_then(|id| window::size(id))
+            .map(Message::WindowResized);
+        (app, Task::batch([tabs_snap, get_size]))
     }
 
     fn sync_notification_badges(&mut self) {
@@ -309,6 +318,27 @@ impl VibeMux {
                 ws.has_unread = has_unread;
             }
         }
+    }
+
+    /// Calculate default terminal dimensions (rows, cols) from a window size.
+    /// Used to give PTYs the correct size from the very first spawn.
+    fn default_term_size(window_size: Size) -> (u16, u16) {
+        const SIDEBAR_W: f32 = 220.0;
+        const MAIN_DIVIDER: f32 = 1.0;
+        const TAB_BAR_H: f32 = 44.0;
+        const TERM_SCROLL_PAD: f32 = 8.0;
+        const STATUS_BAR_H: f32 = 24.0;
+
+        let content_w = window_size.width - SIDEBAR_W - MAIN_DIVIDER;
+        let content_h = window_size.height - TAB_BAR_H;
+        let scroll_h = (content_h - STATUS_BAR_H).max(TERM_LINE_HEIGHT);
+        let cols = ((content_w - TERM_SCROLL_PAD) / TERM_CHAR_WIDTH)
+            .floor()
+            .clamp(1.0, 512.0) as u16;
+        let rows = ((scroll_h - TERM_SCROLL_PAD) / TERM_LINE_HEIGHT)
+            .floor()
+            .clamp(1.0, 256.0) as u16;
+        (rows, cols)
     }
 
     fn resize_terminals_from_window(&mut self) {
@@ -369,9 +399,13 @@ impl VibeMux {
     }
 
     fn spawn_terminal(&mut self, pane_id: PaneId) {
+        let (rows, cols) = self
+            .last_window_size
+            .map(Self::default_term_size)
+            .unwrap_or((40, 120));
         if let Ok(terminal) = Terminal::spawn_with_scrollback(
-            30,
-            120,
+            rows,
+            cols,
             self.config.terminal.shell.as_deref(),
             self.config.terminal.scrollback_limit,
         ) {

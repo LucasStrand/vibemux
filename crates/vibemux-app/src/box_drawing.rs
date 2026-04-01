@@ -1,10 +1,11 @@
-//! Custom geometric rendering for box-drawing characters (U+2500–U+257F).
+//! Custom geometric rendering for box-drawing (U+2500–U+257F) and block
+//! element (U+2580–U+259F) characters.
 //!
 //! Instead of relying on font glyphs (which leave visible gaps between cells),
-//! we detect these characters and draw them as pixel-perfect line segments on
-//! an Iced Canvas overlay.
+//! we detect these characters and draw them as pixel-perfect geometric
+//! primitives on an Iced Canvas overlay.
 
-use iced::widget::canvas::{self, Frame, Geometry, Path, Stroke};
+use iced::widget::canvas::{self, Fill as CanvasFill, Frame, Geometry, Path, Stroke};
 use iced::{Color, Rectangle, Renderer, Theme};
 
 /// Line weight for a given direction.
@@ -23,13 +24,14 @@ enum W {
 /// Directional segments: (left, right, up, down).
 type Seg = (W, W, W, W);
 
-/// A box-drawing character to be rendered on the canvas.
+/// A box-drawing or block-element character to be rendered on the canvas.
 #[derive(Clone)]
 pub struct BoxDrawCell {
     pub row: usize,
     pub col: usize,
     pub ch: char,
-    pub color: Color,
+    pub fg: Color,
+    pub bg: Color,
 }
 
 /// Canvas program that draws box-drawing characters as geometric primitives.
@@ -54,27 +56,30 @@ impl<Message> canvas::Program<Message> for BoxDrawingOverlay {
         let mut frame = Frame::new(renderer, bounds.size());
 
         for cell in &self.cells {
-            let Some(seg) = segments(cell.ch) else {
-                continue;
-            };
-            draw_box_char(
-                &mut frame,
-                cell.col as f32 * self.cell_width + self.padding,
-                cell.row as f32 * self.cell_height + self.padding,
-                self.cell_width,
-                self.cell_height,
-                seg,
-                cell.color,
-            );
+            let x = cell.col as f32 * self.cell_width + self.padding;
+            let y = cell.row as f32 * self.cell_height + self.padding;
+            let w = self.cell_width;
+            let h = self.cell_height;
+
+            if let Some(seg) = segments(cell.ch) {
+                draw_box_char(&mut frame, x, y, w, h, seg, cell.fg);
+            } else if is_block_element(cell.ch) {
+                draw_block_element(&mut frame, x, y, w, h, cell.ch, cell.fg, cell.bg);
+            }
         }
 
         vec![frame.into_geometry()]
     }
 }
 
-/// Returns `true` if `ch` is a box-drawing character we handle.
+/// Returns `true` if `ch` is a box-drawing or block-element character we handle.
 pub fn is_box_drawing(ch: char) -> bool {
-    ('\u{2500}'..='\u{257F}').contains(&ch)
+    ('\u{2500}'..='\u{259F}').contains(&ch)
+}
+
+/// Returns `true` if `ch` is a block-element character (U+2580–U+259F).
+fn is_block_element(ch: char) -> bool {
+    ('\u{2580}'..='\u{259F}').contains(&ch)
 }
 
 /// Map a box-drawing character to its directional segments.
@@ -238,6 +243,100 @@ fn segments(ch: char) -> Option<Seg> {
         _ => return None,
     };
     Some(s)
+}
+
+/// Draw a block element character as a filled rectangle.
+fn draw_block_element(
+    frame: &mut Frame,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    ch: char,
+    fg: Color,
+    _bg: Color,
+) {
+    // Each block element covers a specific portion of the cell.
+    // We express it as (x_offset, y_offset, width, height) in fractions of the cell.
+    let (fx, fy, fw, fh) = match ch {
+        '\u{2580}' => (0.0, 0.0, 1.0, 0.5),   // ▀ upper half
+        '\u{2581}' => (0.0, 7.0/8.0, 1.0, 1.0/8.0), // ▁ lower 1/8
+        '\u{2582}' => (0.0, 3.0/4.0, 1.0, 1.0/4.0), // ▂ lower 1/4
+        '\u{2583}' => (0.0, 5.0/8.0, 1.0, 3.0/8.0), // ▃ lower 3/8
+        '\u{2584}' => (0.0, 0.5, 1.0, 0.5),    // ▄ lower half
+        '\u{2585}' => (0.0, 3.0/8.0, 1.0, 5.0/8.0), // ▅ lower 5/8
+        '\u{2586}' => (0.0, 1.0/4.0, 1.0, 3.0/4.0), // ▆ lower 3/4
+        '\u{2587}' => (0.0, 1.0/8.0, 1.0, 7.0/8.0), // ▇ lower 7/8
+        '\u{2588}' => (0.0, 0.0, 1.0, 1.0),    // █ full block
+        '\u{2589}' => (0.0, 0.0, 7.0/8.0, 1.0), // ▉ left 7/8
+        '\u{258A}' => (0.0, 0.0, 3.0/4.0, 1.0), // ▊ left 3/4
+        '\u{258B}' => (0.0, 0.0, 5.0/8.0, 1.0), // ▋ left 5/8
+        '\u{258C}' => (0.0, 0.0, 0.5, 1.0),    // ▌ left half
+        '\u{258D}' => (0.0, 0.0, 3.0/8.0, 1.0), // ▍ left 3/8
+        '\u{258E}' => (0.0, 0.0, 1.0/4.0, 1.0), // ▎ left 1/4
+        '\u{258F}' => (0.0, 0.0, 1.0/8.0, 1.0), // ▏ left 1/8
+        '\u{2590}' => (0.5, 0.0, 0.5, 1.0),    // ▐ right half
+        '\u{2591}' => (0.0, 0.0, 1.0, 1.0),    // ░ light shade (approximate)
+        '\u{2592}' => (0.0, 0.0, 1.0, 1.0),    // ▒ medium shade
+        '\u{2593}' => (0.0, 0.0, 1.0, 1.0),    // ▓ dark shade
+        '\u{2594}' => (0.0, 0.0, 1.0, 1.0/8.0), // ▔ upper 1/8
+        '\u{2595}' => (7.0/8.0, 0.0, 1.0/8.0, 1.0), // ▕ right 1/8
+        '\u{2596}' => (0.0, 0.5, 0.5, 0.5),    // ▖ quadrant lower left
+        '\u{2597}' => (0.5, 0.5, 0.5, 0.5),    // ▗ quadrant lower right
+        '\u{2598}' => (0.0, 0.0, 0.5, 0.5),    // ▘ quadrant upper left
+        '\u{2599}' => return draw_quadrants(frame, x, y, w, h, fg, true, false, true, true),
+        '\u{259A}' => return draw_quadrants(frame, x, y, w, h, fg, true, false, false, true),
+        '\u{259B}' => return draw_quadrants(frame, x, y, w, h, fg, true, true, true, false),
+        '\u{259C}' => return draw_quadrants(frame, x, y, w, h, fg, true, true, false, true),
+        '\u{259D}' => (0.5, 0.0, 0.5, 0.5),    // ▝ quadrant upper right
+        '\u{259E}' => return draw_quadrants(frame, x, y, w, h, fg, false, true, true, false),
+        '\u{259F}' => return draw_quadrants(frame, x, y, w, h, fg, false, true, true, true),
+        _ => return,
+    };
+
+    // For shade characters, use reduced opacity.
+    let color = match ch {
+        '\u{2591}' => Color { a: fg.a * 0.25, ..fg },
+        '\u{2592}' => Color { a: fg.a * 0.50, ..fg },
+        '\u{2593}' => Color { a: fg.a * 0.75, ..fg },
+        _ => fg,
+    };
+
+    let rect = Path::rectangle(
+        iced::Point::new(x + fx * w, y + fy * h),
+        iced::Size::new(fw * w, fh * h),
+    );
+    frame.fill(&rect, CanvasFill::from(color));
+}
+
+/// Draw multiple quadrants of the cell.
+fn draw_quadrants(
+    frame: &mut Frame,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    color: Color,
+    upper_left: bool,
+    upper_right: bool,
+    lower_left: bool,
+    lower_right: bool,
+) {
+    let hw = w / 2.0;
+    let hh = h / 2.0;
+    let fill = CanvasFill::from(color);
+    if upper_left {
+        frame.fill(&Path::rectangle(iced::Point::new(x, y), iced::Size::new(hw, hh)), fill);
+    }
+    if upper_right {
+        frame.fill(&Path::rectangle(iced::Point::new(x + hw, y), iced::Size::new(hw, hh)), fill);
+    }
+    if lower_left {
+        frame.fill(&Path::rectangle(iced::Point::new(x, y + hh), iced::Size::new(hw, hh)), fill);
+    }
+    if lower_right {
+        frame.fill(&Path::rectangle(iced::Point::new(x + hw, y + hh), iced::Size::new(hw, hh)), fill);
+    }
 }
 
 const LIGHT_WIDTH: f32 = 1.0;
