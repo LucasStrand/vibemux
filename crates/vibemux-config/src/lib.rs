@@ -65,8 +65,8 @@ impl Default for Config {
 impl Default for FontConfig {
     fn default() -> Self {
         Self {
-            family: "Cascadia Code".into(),
-            size: 14.0,
+            family: "Cascadia Mono".into(),
+            size: 16.0,
         }
     }
 }

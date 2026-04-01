@@ -1,8 +1,8 @@
 //! Terminal text selection in display (scrollback + screen) coordinates.
 use vibemux_term::grid::TerminalGrid;
 
-pub const TERM_FONT_SIZE: f32 = 14.0;
-pub const TERM_LINE_HEIGHT: f32 = 18.0;
+pub const TERM_FONT_SIZE: f32 = 16.0;
+pub const TERM_LINE_HEIGHT: f32 = 20.0;
 /// Approximate monospace advance; keep in sync with `TERM_FONT_SIZE`.
 pub const TERM_CHAR_WIDTH: f32 = TERM_FONT_SIZE * 0.6;
 

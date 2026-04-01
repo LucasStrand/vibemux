@@ -26,6 +26,8 @@ impl PtyBackend {
 
         let mut cmd = CommandBuilder::new(&shell_cmd);
         cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
+        cmd.env("TERM_PROGRAM", "vibemux");
         cmd.env("VIBEMUX", "1");
 
         let child = pair.slave.spawn_command(cmd)?;

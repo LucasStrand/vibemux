@@ -82,8 +82,8 @@ Create `%APPDATA%\vibemux\config.toml`:
 
 ```toml
 [font]
-family = "Cascadia Code"
-size = 14.0
+family = "Cascadia Mono"
+size = 16.0
 
 [appearance]
 theme = "Dark"
