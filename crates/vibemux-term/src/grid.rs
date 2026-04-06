@@ -165,6 +165,32 @@ impl TerminalGrid {
         }
     }
 
+    pub fn using_alt_screen(&self) -> bool {
+        self.using_alt_screen
+    }
+
+    /// Blank every visible cell and home the cursor. Used after a geometry change
+    /// so TUIs (alternate **or** primary buffer) do not paint on stale cells; many
+    /// apps redraw incrementally without ED clear after SIGWINCH/ConPTY resize.
+    pub fn wipe_visible_screen(&mut self) {
+        for row in &mut self.cells {
+            for cell in row.iter_mut() {
+                *cell = Cell::default();
+            }
+        }
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+        self.wrap_pending = false;
+        self.current_attrs = CellAttributes::default();
+        self.dirty = true;
+    }
+
+    /// Drop scrollback lines (e.g. after resize so stacked partial redraws vanish).
+    pub fn clear_scrollback(&mut self) {
+        self.scrollback.clear();
+        self.dirty = true;
+    }
+
     pub fn resize(&mut self, rows: usize, cols: usize) {
         self.rows = rows;
         self.cols = cols;
@@ -958,7 +984,9 @@ impl vte::Perform for VteHandler<'_> {
                             1002 => self.grid.mouse_tracking = MouseTracking::ButtonEvent,
                             1003 => self.grid.mouse_tracking = MouseTracking::AnyEvent,
                             1006 => self.grid.mouse_sgr_mode = true,
-                            1049 => self.grid.enter_alternate_screen(),
+                            // Alternate screen: 1049 (save cursor + alt) is most common;
+                            // 47 / 1047 are legacy forms some TUIs still emit.
+                            47 | 1047 | 1049 => self.grid.enter_alternate_screen(),
                             2004 => {}
                             _ => {}
                         }
@@ -975,7 +1003,7 @@ impl vte::Perform for VteHandler<'_> {
                             25 => self.grid.cursor_visible = false,
                             1000 | 1002 | 1003 => self.grid.mouse_tracking = MouseTracking::Off,
                             1006 => self.grid.mouse_sgr_mode = false,
-                            1049 => self.grid.exit_alternate_screen(),
+                            47 | 1047 | 1049 => self.grid.exit_alternate_screen(),
                             2004 => {}
                             _ => {}
                         }

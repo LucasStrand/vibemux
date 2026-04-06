@@ -68,6 +68,13 @@ impl PtyReader {
         result
     }
 
+    /// Drop queued bytes without applying them. Used after a PTY resize so output
+    /// formatted for the previous width/height is not parsed into the new grid.
+    pub fn discard_queue(&self) {
+        self.has_data.store(false, Ordering::Relaxed);
+        self.buffer.lock().unwrap().clear();
+    }
+
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
     }

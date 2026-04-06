@@ -1,9 +1,11 @@
 use crate::app::Message;
 use crate::box_drawing::{self, BoxDrawCell, BoxDrawingOverlay};
-use crate::term_selection::{TerminalSelection, TERM_CHAR_WIDTH, TERM_LINE_HEIGHT};
+use crate::term_selection::{
+    term_char_width, term_line_height, TerminalSelection,
+};
 use crate::theme;
 use iced::widget::canvas;
-use iced::widget::text::{LineHeight, Span};
+use iced::widget::text::{LineHeight, Span, Wrapping};
 use iced::widget::{column, container, mouse_area, rich_text, scrollable, span, stack, Column, Id};
 use iced::{Color, Element, Fill, Font, Length, Theme};
 use iced::mouse::Interaction;
@@ -51,6 +53,27 @@ fn has_non_default_bg(attrs: &CellAttributes) -> bool {
     bg != TermColor::DEFAULT_BG
 }
 
+/// Bold/italic must not change the monospace advance: the box-drawing canvas is on a fixed grid.
+fn terminal_fg_for_cell(fg: Color, bold: bool, italic: bool, dim: bool) -> Color {
+    let mut c = fg;
+    if dim {
+        c = Color::from_rgba(c.r, c.g, c.b, c.a * 0.5);
+    }
+    if bold {
+        c = Color::from_rgba(
+            (c.r * 1.2 + 0.04).min(1.0),
+            (c.g * 1.2 + 0.04).min(1.0),
+            (c.b * 1.2 + 0.04).min(1.0),
+            c.a,
+        );
+    }
+    if italic {
+        // No italic face: slight cool shift so it stays distinguishable without changing metrics.
+        c = Color::from_rgba((c.r * 0.92).max(0.0), (c.g * 0.96).max(0.0), c.b.min(1.0), c.a);
+    }
+    c
+}
+
 /// A contiguous run of cells sharing the same visual attributes.
 struct SpanRun {
     text: String,
@@ -72,6 +95,8 @@ fn line_element<'a>(
     v_col: usize,
     font: Font,
     font_size: f32,
+    char_width: f32,
+    line_height: f32,
 ) -> Element<'a, Message> {
     let is_cursor_row = row_idx == v_row;
     let cols = grid.cols;
@@ -140,37 +165,13 @@ fn line_element<'a>(
     let spans: Vec<Span<'a, (), Font>> = runs
         .into_iter()
         .map(|run| {
-            // Apply dim by reducing the foreground color intensity.
-            let fg = if run.dim {
-                Color::from_rgba(run.fg.r, run.fg.g, run.fg.b, run.fg.a * 0.5)
-            } else {
-                run.fg
-            };
+            let fg = terminal_fg_for_cell(run.fg, run.bold, run.italic, run.dim);
             let mut s = span(run.text)
                 .size(font_size)
                 .font(font)
                 .color(fg);
             if let Some(bg) = run.bg {
                 s = s.background(bg);
-            }
-            if run.bold {
-                s = s.font(Font {
-                    weight: iced::font::Weight::Bold,
-                    ..font
-                });
-            }
-            if run.italic {
-                s = s.font(Font {
-                    style: iced::font::Style::Italic,
-                    ..if run.bold {
-                        Font {
-                            weight: iced::font::Weight::Bold,
-                            ..font
-                        }
-                    } else {
-                        font
-                    }
-                });
             }
             if run.underline {
                 s = s.underline(true);
@@ -182,14 +183,17 @@ fn line_element<'a>(
         })
         .collect();
 
+    let line_w = cols as f32 * char_width;
     let rt = rich_text(spans)
         .size(font_size)
-        .line_height(LineHeight::Absolute(TERM_LINE_HEIGHT.into()))
+        .line_height(LineHeight::Absolute(line_height.into()))
         .font(font)
-        .width(Fill);
+        .width(Length::Fixed(line_w))
+        .wrapping(Wrapping::None);
 
     container(rt)
-        .height(Length::Fixed(TERM_LINE_HEIGHT))
+        .width(Length::Fixed(line_w))
+        .height(Length::Fixed(line_height))
         .into()
 }
 
@@ -201,6 +205,8 @@ pub fn view<'a>(
     font: Font,
     font_size: f32,
 ) -> Element<'a, Message> {
+    let char_width = term_char_width(font_size);
+    let line_height = term_line_height(font_size);
     let mut lines = Column::new().spacing(0);
     let mut box_cells: Vec<BoxDrawCell> = Vec::new();
 
@@ -238,6 +244,8 @@ pub fn view<'a>(
             v_col,
             font,
             font_size,
+            char_width,
+            line_height,
         ));
     }
 
@@ -250,7 +258,7 @@ pub fn view<'a>(
             ..Default::default()
         });
 
-    let content_height = n_lines as f32 * TERM_LINE_HEIGHT + 8.0; // +padding
+    let content_height = n_lines as f32 * line_height + 8.0; // +padding
 
     let lines_pane = container(lines)
         .width(Fill)
@@ -266,8 +274,8 @@ pub fn view<'a>(
     } else {
         let overlay = BoxDrawingOverlay {
             cells: box_cells,
-            cell_width: TERM_CHAR_WIDTH,
-            cell_height: TERM_LINE_HEIGHT,
+            cell_width: char_width,
+            cell_height: line_height,
             padding: 4.0,
         };
         stack![

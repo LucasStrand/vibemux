@@ -8,7 +8,7 @@ use crate::term_selection::{
     input_start_column, logical_line_end_col, move_cell as sel_move_cell, point_to_cell,
     selection_text, TerminalSelection,
 };
-use crate::term_selection::{TERM_CHAR_WIDTH, TERM_LINE_HEIGHT};
+use crate::term_selection::{term_char_width, term_line_height};
 use crate::{notification_panel, resize_layout, sidebar, split_view, tab_bar, theme};
 use iced::clipboard;
 use iced::keyboard;
@@ -136,7 +136,8 @@ impl VibeMux {
         // Pre-calculate terminal dimensions from the known initial window size
         // so that PTYs start with correct dimensions from the very first spawn.
         let initial_window = Size::new(1200.0, 800.0);
-        let (init_rows, init_cols) = Self::default_term_size(initial_window);
+        let (init_rows, init_cols) =
+            Self::default_term_size(initial_window, term_font_size);
 
         if let Some(session) = &restored {
             // Rebuild workspaces from session state.
@@ -267,7 +268,7 @@ impl VibeMux {
             });
         });
 
-        let app = Self {
+        let mut app = Self {
             workspace_manager: manager,
             terminals,
             pty_readers,
@@ -277,7 +278,7 @@ impl VibeMux {
             ipc_rx,
             next_workspace_num: 2,
             show_notification_panel: false,
-            last_window_size: None,
+            last_window_size: Some(initial_window),
             last_session_save: std::time::Instant::now(),
             bytes_received: 0,
             terminal_stick_to_bottom: stick,
@@ -291,6 +292,9 @@ impl VibeMux {
             term_font_size,
             split_drag_active: None,
         };
+        // Resize terminals to match the initial window size immediately so the
+        // PTY dimensions are correct before any output arrives.
+        app.resize_terminals_from_window();
         let tabs_snap = app.snap_shell_tabs_task();
         // Query the actual window size so we can resize terminals to match.
         // resize_events() only fires on *changes*, so we need this initial query.
@@ -298,6 +302,14 @@ impl VibeMux {
             .and_then(|id| window::size(id))
             .map(Message::WindowResized);
         (app, Task::batch([tabs_snap, get_size]))
+    }
+
+    #[inline]
+    fn term_metrics(&self) -> (f32, f32) {
+        (
+            term_char_width(self.term_font_size),
+            term_line_height(self.term_font_size),
+        )
     }
 
     fn sync_notification_badges(&mut self) {
@@ -322,20 +334,22 @@ impl VibeMux {
 
     /// Calculate default terminal dimensions (rows, cols) from a window size.
     /// Used to give PTYs the correct size from the very first spawn.
-    fn default_term_size(window_size: Size) -> (u16, u16) {
+    fn default_term_size(window_size: Size, font_size: f32) -> (u16, u16) {
         const SIDEBAR_W: f32 = 220.0;
         const MAIN_DIVIDER: f32 = 1.0;
         const TAB_BAR_H: f32 = 44.0;
         const TERM_SCROLL_PAD: f32 = 8.0;
         const STATUS_BAR_H: f32 = 24.0;
 
+        let cw = term_char_width(font_size);
+        let lh = term_line_height(font_size);
         let content_w = window_size.width - SIDEBAR_W - MAIN_DIVIDER;
         let content_h = window_size.height - TAB_BAR_H;
-        let scroll_h = (content_h - STATUS_BAR_H).max(TERM_LINE_HEIGHT);
-        let cols = ((content_w - TERM_SCROLL_PAD) / TERM_CHAR_WIDTH)
+        let scroll_h = (content_h - STATUS_BAR_H).max(lh);
+        let cols = ((content_w - TERM_SCROLL_PAD) / cw)
             .floor()
             .clamp(1.0, 512.0) as u16;
-        let rows = ((scroll_h - TERM_SCROLL_PAD) / TERM_LINE_HEIGHT)
+        let rows = ((scroll_h - TERM_SCROLL_PAD) / lh)
             .floor()
             .clamp(1.0, 256.0) as u16;
         (rows, cols)
@@ -380,18 +394,26 @@ impl VibeMux {
             }
         }
 
+        let cw = term_char_width(self.term_font_size);
+        let lh = term_line_height(self.term_font_size);
         for (pane_id, pw, ph) in work {
-            let scroll_h = (ph - STATUS_BAR_H).max(TERM_LINE_HEIGHT);
-            let cols_f = ((pw - TERM_SCROLL_PAD) / TERM_CHAR_WIDTH).floor();
-            let rows_f =
-                ((scroll_h - TERM_SCROLL_PAD) / TERM_LINE_HEIGHT).floor();
+            let scroll_h = (ph - STATUS_BAR_H).max(lh);
+            let cols_f = ((pw - TERM_SCROLL_PAD) / cw).floor();
+            let rows_f = ((scroll_h - TERM_SCROLL_PAD) / lh).floor();
             let cols = cols_f.clamp(1.0, 512.0) as u16;
             let rows = rows_f.clamp(1.0, 256.0) as u16;
 
             if let Some(term) = self.terminals.get_mut(&pane_id) {
                 if term.grid.cols != cols as usize || term.grid.rows != rows as usize {
-                    if let Err(e) = term.resize(rows, cols) {
-                        log::warn!("terminal resize failed for pane {pane_id:?}: {e}");
+                    match term.resize(rows, cols) {
+                        Ok(()) => {
+                            if let Some(reader) = self.pty_readers.get(&pane_id) {
+                                reader.discard_queue();
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("terminal resize failed for pane {pane_id:?}: {e}");
+                        }
                     }
                 }
             }
@@ -401,7 +423,7 @@ impl VibeMux {
     fn spawn_terminal(&mut self, pane_id: PaneId) {
         let (rows, cols) = self
             .last_window_size
-            .map(Self::default_term_size)
+            .map(|s| Self::default_term_size(s, self.term_font_size))
             .unwrap_or((40, 120));
         if let Ok(terminal) = Terminal::spawn_with_scrollback(
             rows,
@@ -643,6 +665,7 @@ impl VibeMux {
                     .insert(pane_id, stick_to_bottom);
             }
             Message::TerminalMouseMove(pane_id, pt) => {
+                let (cw, lh) = self.term_metrics();
                 self.terminal_pointer_local.insert(pane_id, pt);
 
                 // Forward mouse move to terminal app if it wants tracking.
@@ -650,7 +673,8 @@ impl VibeMux {
                     if let Some(terminal) = self.terminals.get_mut(&pane_id) {
                         if terminal.grid.mouse_tracking == vibemux_term::MouseTracking::AnyEvent {
                             let grid = &terminal.grid;
-                            let (r, c) = point_to_cell(pt.x, pt.y, grid.cols, grid.rows);
+                            let (r, c) =
+                                point_to_cell(pt.x, pt.y, grid.cols, grid.rows, cw, lh);
                             terminal.send_mouse_event(vibemux_term::MouseEvent {
                                 kind: vibemux_term::MouseEventKind::Move,
                                 button: vibemux_term::MouseButton::Left,
@@ -666,7 +690,7 @@ impl VibeMux {
                         let grid = &terminal.grid;
                         let n = grid.display_line_count();
                         let cols = grid.cols;
-                        let (r, c) = point_to_cell(pt.x, pt.y, cols, n);
+                        let (r, c) = point_to_cell(pt.x, pt.y, cols, n, cw, lh);
                         let cell = clamp_cell_for_input_line(grid, r, c);
                         if let Some((p, anchor)) = self.selection_pending_anchor {
                             if p == pane_id {
@@ -685,6 +709,7 @@ impl VibeMux {
                 }
             }
             Message::TerminalMouseDown(pane_id) => {
+                let (cw, lh) = self.term_metrics();
                 // Check if the terminal app wants mouse events.
                 if let Some(terminal) = self.terminals.get_mut(&pane_id) {
                     if terminal.grid.mouse_tracking != vibemux_term::MouseTracking::Off {
@@ -694,7 +719,7 @@ impl VibeMux {
                             .copied()
                             .unwrap_or_else(|| Point::new(5.0, 5.0));
                         let grid = &terminal.grid;
-                        let (r, c) = point_to_cell(p.x, p.y, grid.cols, grid.rows);
+                        let (r, c) = point_to_cell(p.x, p.y, grid.cols, grid.rows, cw, lh);
                         let consumed = terminal.send_mouse_event(vibemux_term::MouseEvent {
                             kind: vibemux_term::MouseEventKind::Press,
                             button: vibemux_term::MouseButton::Left,
@@ -734,12 +759,13 @@ impl VibeMux {
                     .get(&pane_id)
                     .copied()
                     .unwrap_or_else(|| Point::new(5.0, 5.0));
-                let (r, c) = point_to_cell(p.x, p.y, cols, n);
+                let (r, c) = point_to_cell(p.x, p.y, cols, n, cw, lh);
                 let cell = clamp_cell_for_input_line(grid, r, c);
                 self.selection_pending_anchor = Some((pane_id, cell));
                 self.terminal_selection.insert(pane_id, None);
             }
             Message::TerminalMouseUpAnywhere => {
+                let (cw, lh) = self.term_metrics();
                 // Send release to terminal app if mouse tracking.
                 if let Some(focused) = self.focused_pane_id() {
                     if let Some(terminal) = self.terminals.get_mut(&focused) {
@@ -750,7 +776,7 @@ impl VibeMux {
                                 .copied()
                                 .unwrap_or_else(|| Point::new(5.0, 5.0));
                             let grid = &terminal.grid;
-                            let (r, c) = point_to_cell(p.x, p.y, grid.cols, grid.rows);
+                            let (r, c) = point_to_cell(p.x, p.y, grid.cols, grid.rows, cw, lh);
                             terminal.send_mouse_event(vibemux_term::MouseEvent {
                                 kind: vibemux_term::MouseEventKind::Release,
                                 button: vibemux_term::MouseButton::Left,
