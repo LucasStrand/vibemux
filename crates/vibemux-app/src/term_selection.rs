@@ -1,10 +1,17 @@
 //! Terminal text selection in display (scrollback + screen) coordinates.
 use vibemux_term::grid::TerminalGrid;
 
-pub const TERM_FONT_SIZE: f32 = 16.0;
-pub const TERM_LINE_HEIGHT: f32 = 20.0;
-/// Approximate monospace advance; keep in sync with `TERM_FONT_SIZE`.
-pub const TERM_CHAR_WIDTH: f32 = TERM_FONT_SIZE * 0.6;
+/// Monospace horizontal advance used for PTY sizing, hit-testing, and overlays.
+#[inline]
+pub fn term_char_width(font_size: f32) -> f32 {
+    font_size * 0.6
+}
+
+/// Line box height matching `LineHeight::Absolute` in the terminal view.
+#[inline]
+pub fn term_line_height(font_size: f32) -> f32 {
+    font_size * 1.25
+}
 
 const PADDING: f32 = 4.0;
 
@@ -244,12 +251,19 @@ pub fn move_cell(
     (nr, nc)
 }
 
-pub fn point_to_cell(x: f32, y: f32, cols: usize, n_lines: usize) -> (usize, usize) {
+pub fn point_to_cell(
+    x: f32,
+    y: f32,
+    cols: usize,
+    n_lines: usize,
+    char_width: f32,
+    line_height: f32,
+) -> (usize, usize) {
     if n_lines == 0 || cols == 0 {
         return (0, 0);
     }
-    let row = ((y - PADDING) / TERM_LINE_HEIGHT).floor().max(0.0) as usize;
-    let col = ((x - PADDING) / TERM_CHAR_WIDTH).floor().max(0.0) as usize;
+    let row = ((y - PADDING) / line_height).floor().max(0.0) as usize;
+    let col = ((x - PADDING) / char_width).floor().max(0.0) as usize;
     (
         row.min(n_lines.saturating_sub(1)),
         col.min(cols.saturating_sub(1)),

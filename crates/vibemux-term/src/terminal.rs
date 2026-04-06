@@ -37,8 +37,22 @@ impl Terminal {
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) -> Result<()> {
+        let prev_rows = self.grid.rows;
+        let prev_cols = self.grid.cols;
+        let new_rows = rows as usize;
+        let new_cols = cols as usize;
+
         self.pty.resize(rows, cols)?;
-        self.grid.resize(rows as usize, cols as usize);
+        self.grid.resize(new_rows, new_cols);
+
+        if (prev_rows, prev_cols) != (new_rows, new_cols) {
+            // Full reset: TUIs often run on the primary buffer (scrollback grows) and
+            // redraw without clearing; wiping only on alt screen left ghosting + stacks
+            // in scrollback. Box-drawing overlay + stale cells also desync borders.
+            self.parser = vte::Parser::new();
+            self.grid.wipe_visible_screen();
+            self.grid.clear_scrollback();
+        }
         Ok(())
     }
 
